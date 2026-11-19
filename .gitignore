@@ -1,0 +1,4 @@
+auth-router
+src/router_psy_builtin.h
+result
+*.o

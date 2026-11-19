@@ -1,0 +1,199 @@
+config {
+  now_ms: i64 = 0,
+  exclude_provider: str[64] = "",
+  prefer_id: str[64] = "",
+  top_id: str[64] = "",
+  rotate_from_id: str[64] = "",
+  req_seq: i64 = 1,
+}
+
+input routes[3] {
+  key rank: i64,
+  provider: str[64],
+  model: str[64],
+}
+
+input logins[4] {
+  key id: str[64],
+  provider: str[64],
+  order_pos: i64,
+  finished: bool,
+  access_tok: str[128] secret,
+  refresh_tok: str[128] secret,
+}
+
+input holds[4] {
+  key id: i64,
+  login_id: str[64],
+  model: str[64],
+  until_ms: i64,
+}
+
+input unavailable[4] {
+  key id: i64,
+  login_id: str[64],
+  model: str[64],
+}
+
+state sticky[1] {
+  key id: i64,
+  last_login: str[64],
+  last_provider: str[64],
+  last_model: str[64],
+}
+
+query allowed_routes from r = routes
+  where config.exclude_provider == "" || r.provider != config.exclude_provider
+  select { ...r }
+  budget max_active <= 3
+
+aggregate primary_route from r = allowed_routes
+  select { primary_rank = min(r.rank), allowed_cnt = count() }
+
+query candidates from r = allowed_routes, l = logins
+  where l.finished && l.provider == r.provider
+  let pref_bucket = if config.prefer_id != "" && l.id == config.prefer_id then 0 else 1
+  let top_bucket = if config.top_id != "" && l.id == config.top_id then 0 else 1
+  let rot_bucket = if config.rotate_from_id != "" && l.id == config.rotate_from_id then 1 else 0
+  select {
+    route_rank = r.rank,
+    provider = r.provider,
+    model = r.model,
+    login_id = l.id,
+    order_pos = l.order_pos,
+    pref_bucket = pref_bucket,
+    top_bucket = top_bucket,
+    rot_bucket = rot_bucket,
+    access_tok = l.access_tok,
+    refresh_tok = l.refresh_tok,
+  }
+  budget max_active <= 12
+
+group ranked_cands from c = candidates
+  by 0 order c.route_rank asc, c.pref_bucket asc, c.top_bucket asc, c.rot_bucket asc, c.order_pos asc
+  select { ...c, queue_pos = rank() }
+  budget max_active <= 12
+
+query cand_state from c = ranked_cands
+  let is_held = exists(holds, h => h.login_id == c.login_id && (h.model == "" || h.model == c.model) && h.until_ms > config.now_ms)
+  let is_unavail = exists(unavailable, u => u.login_id == c.login_id && u.model == c.model)
+  let ready = !is_unavail && !is_held
+  select {
+    ...c,
+    is_held = is_held,
+    is_unavail = is_unavail,
+    ready = ready,
+  }
+  budget max_active <= 12
+
+query ready_cands from c = cand_state
+  where c.ready
+  select { ...c }
+  budget max_active <= 12
+
+aggregate best_ready from r = ready_cands
+  select { best_pos = min(r.queue_pos), ready_cnt = count(), has_ready = count() > 0 }
+
+query selected from r = ready_cands
+  where best_ready.ready_cnt > 0 && r.queue_pos == best_ready.best_pos
+  select {
+    key id = 1,
+    login_id = r.login_id,
+    provider = r.provider,
+    model = r.model,
+    route_rank = r.route_rank,
+    queue_pos = r.queue_pos,
+    access_tok = r.access_tok,
+    refresh_tok = r.refresh_tok,
+  }
+  budget max_active <= 1
+
+query waiting_holds from c = cand_state, h = holds
+  where !c.is_unavail && h.login_id == c.login_id && (h.model == "" || h.model == c.model) && h.until_ms > config.now_ms
+  select {
+    route_rank = c.route_rank,
+    wait_ms = h.until_ms - config.now_ms,
+  }
+  budget max_active <= 48
+
+aggregate wait_agg from w = waiting_holds
+  select { min_wait_ms = min(w.wait_ms), holding_cnt = count() }
+
+query primary_waiting from w = waiting_holds
+  where w.route_rank == primary_route.primary_rank
+  select { wait_ms = w.wait_ms }
+  budget max_active <= 48
+
+aggregate primary_wait_agg from w = primary_waiting
+  select { min_wait_ms = min(w.wait_ms), holding_cnt = count() }
+
+aggregate cand_summary from c = cand_state
+  select { cand_cnt = count(), ready_cnt = sum(if c.ready then 1 else 0) }
+
+query selected_audit from s = selected
+  where cand_summary.ready_cnt > 0
+  let is_fb = s.route_rank > primary_route.primary_rank
+  let p_retry = if is_fb then primary_wait_agg.min_wait_ms else 0
+  select {
+    key id = config.req_seq,
+    selected_login = s.login_id,
+    provider = s.provider,
+    model = s.model,
+    route_rank = s.route_rank,
+    is_fallback = is_fb,
+    primary_retry_ms = p_retry,
+    http_status = 200,
+    retry_ms = 0,
+    retry_s = 0,
+    ready_cnt = cand_summary.ready_cnt,
+  }
+  budget max_active <= 1
+
+query refused_audit from cs = cand_summary
+  where cs.ready_cnt == 0
+  select {
+    key id = config.req_seq,
+    selected_login = "",
+    provider = "",
+    model = "",
+    route_rank = -1,
+    is_fallback = false,
+    primary_retry_ms = primary_wait_agg.min_wait_ms,
+    http_status = if wait_agg.min_wait_ms > 0 then 429 else 404,
+    retry_ms = wait_agg.min_wait_ms,
+    retry_s = (wait_agg.min_wait_ms + 999) / 1000,
+    ready_cnt = 0,
+  }
+  budget max_active <= 1
+
+union audit_log (selected_audit, refused_audit) budget max_active <= 1
+
+mount m_slot from selected when best_ready.has_ready budget max_active <= 1
+
+next sticky from a = audit_log
+  select {
+    key id = 0,
+    last_login = a.selected_login,
+    last_provider = a.provider,
+    last_model = a.model,
+  }
+
+export secret m_slot
+export public audit_log
+export public cand_summary
+export public wait_agg
+export public primary_wait_agg
+
+invariant only_finished_and_matching_provider : forall s in m_slot => exists(logins, l => s.login_id == l.id && l.finished && l.provider == s.provider) && exists(routes, r => r.rank == s.route_rank && r.provider == s.provider && r.model == s.model)
+invariant never_excluded_provider : forall s in m_slot => config.exclude_provider == "" || s.provider != config.exclude_provider
+invariant no_held_mounted : forall s in m_slot => !exists(holds, h => s.login_id == h.login_id && (h.model == "" || h.model == s.model) && h.until_ms > config.now_ms)
+invariant no_unavail_mounted : forall s in m_slot => !exists(unavailable, u => s.login_id == u.login_id && u.model == s.model)
+invariant unmounted_on_exhaustion : forall s in m_slot => cand_summary.ready_cnt > 0
+invariant single_active_slot : count(m_slot) <= 1
+invariant route_priority_optimal : forall s in m_slot => !exists(ready_cands, rc => rc.route_rank < s.route_rank)
+invariant fallback_flag_sound : forall a in audit_log => a.http_status != 200 || (a.is_fallback == (a.route_rank > primary_route.primary_rank) && (a.is_fallback || a.primary_retry_ms == 0))
+invariant refused_status_valid : forall a in audit_log => a.http_status == 200 || a.http_status == 429 && a.retry_ms > 0 || a.http_status == 404 && a.retry_ms == 0
+invariant audit_noninterference : noninterference(audit_log)
+invariant summary_noninterference : noninterference(cand_summary)
+invariant wait_noninterference : noninterference(wait_agg)
+invariant primary_wait_noninterference : noninterference(primary_wait_agg)
