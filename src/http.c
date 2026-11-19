@@ -20,8 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#define HTTP_MAX_RESPONSE_BYTES (4 * 1024 * 1024)
 
 typedef struct {
     bool is_https;
@@ -36,8 +39,45 @@ typedef struct {
     int64_t deadline_ms;
 } bio_ctx_t;
 
+typedef struct {
+    bool initialized;
+    bool ca_loaded;
+    pid_t pid;
+    char ca_path[1024];
+    mbedtls_x509_crt cacert;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+} tls_cache_t;
+
+static tls_cache_t g_tls_cache;
+
+static bool has_ctl_or_crlf(const char *s) {
+    if (!s) return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) return true;
+    }
+    return false;
+}
+
+static bool has_crlf(const char *s) {
+    if (!s) return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '\r' || *p == '\n') return true;
+    }
+    return false;
+}
+
+static void set_cloexec(int fd) {
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
+
 static bool parse_url(const char *url, parsed_url_t *out, char *err, size_t err_n) {
     memset(out, 0, sizeof(*out));
+    if (!url || !url[0] || has_ctl_or_crlf(url)) {
+        snprintf(err, err_n, "invalid character in URL");
+        return false;
+    }
     const char *p = url;
     if (strncmp(p, "https://", 8) == 0) {
         out->is_https = true;
@@ -63,7 +103,13 @@ static bool parse_url(const char *url, parsed_url_t *out, char *err, size_t err_
         host_end = rb;
         p = rb + 1;
     } else {
-        while (*p && *p != ':' && *p != '/' && *p != '?') p++;
+        while (*p && *p != ':' && *p != '/' && *p != '?') {
+            if (*p == ' ' || *p == '\t') {
+                snprintf(err, err_n, "invalid whitespace in URL host");
+                return false;
+            }
+            p++;
+        }
         host_end = p;
     }
     size_t hlen = (size_t)(host_end - host_start);
@@ -95,12 +141,28 @@ static bool parse_url(const char *url, parsed_url_t *out, char *err, size_t err_
         snprintf(out->port, sizeof(out->port), "%d", out->port_num);
     }
 
+    if (*p && *p != '/' && *p != '?') {
+        snprintf(err, err_n, "invalid URL path separator");
+        return false;
+    }
+    for (const char *q = p; *q; q++) {
+        if (*q == ' ' || *q == '\t') {
+            snprintf(err, err_n, "invalid whitespace in URL path");
+            return false;
+        }
+    }
+
+    int pn = 0;
     if (*p == '\0') {
-        snprintf(out->path, sizeof(out->path), "/");
+        pn = snprintf(out->path, sizeof(out->path), "/");
     } else if (*p == '?') {
-        snprintf(out->path, sizeof(out->path), "/%s", p);
+        pn = snprintf(out->path, sizeof(out->path), "/%s", p);
     } else {
-        snprintf(out->path, sizeof(out->path), "%s", p);
+        pn = snprintf(out->path, sizeof(out->path), "%s", p);
+    }
+    if (pn < 0 || (size_t)pn >= sizeof(out->path)) {
+        snprintf(err, err_n, "URL path exceeds maximum length");
+        return false;
     }
     return true;
 }
@@ -144,6 +206,7 @@ static int tcp_connect_timeout(const char *host, const char *port, int64_t deadl
             last_err = errno;
             continue;
         }
+        set_cloexec(fd);
         int fl = fcntl(fd, F_GETFL, 0);
         if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 
@@ -212,7 +275,7 @@ static int bio_recv_cb(void *ctx, unsigned char *buf, size_t len) {
     }
 }
 
-static bool load_ca_bundle(mbedtls_x509_crt *cacert, char *err, size_t err_n) {
+static const char *resolve_ca_bundle_path(void) {
     const char *candidates[4];
     candidates[0] = getenv("AUTH_ROUTER_CA_FILE");
     candidates[1] = getenv("SSL_CERT_FILE");
@@ -222,14 +285,68 @@ static bool load_ca_bundle(mbedtls_x509_crt *cacert, char *err, size_t err_n) {
     for (size_t i = 0; i < 4; i++) {
         const char *path = candidates[i];
         if (!path || !*path) continue;
-        if (access(path, R_OK) != 0) continue;
-        int rc = mbedtls_x509_crt_parse_file(cacert, path);
-        if (rc >= 0) return true;
-        mbedtls_x509_crt_free(cacert);
-        mbedtls_x509_crt_init(cacert);
+        if (access(path, R_OK) == 0) return path;
     }
-    snprintf(err, err_n, "unable to load CA certificate bundle");
-    return false;
+    return NULL;
+}
+
+static bool tls_cache_prepare(char *err, size_t err_n) {
+    if (!g_tls_cache.initialized) {
+        psa_status_t psa_rc = psa_crypto_init();
+        if (psa_rc != PSA_SUCCESS) {
+            snprintf(err, err_n, "psa_crypto_init failed: %d", (int)psa_rc);
+            return false;
+        }
+        mbedtls_x509_crt_init(&g_tls_cache.cacert);
+        mbedtls_entropy_init(&g_tls_cache.entropy);
+        mbedtls_ctr_drbg_init(&g_tls_cache.ctr_drbg);
+
+        const char *pers = "auth-router";
+        int rc = mbedtls_ctr_drbg_seed(&g_tls_cache.ctr_drbg, mbedtls_entropy_func, &g_tls_cache.entropy,
+                                       (const unsigned char *)pers, strlen(pers));
+        if (rc != 0) {
+            snprintf(err, err_n, "tls drbg seed failed: -0x%04x", (unsigned)(-rc));
+            mbedtls_x509_crt_free(&g_tls_cache.cacert);
+            mbedtls_ctr_drbg_free(&g_tls_cache.ctr_drbg);
+            mbedtls_entropy_free(&g_tls_cache.entropy);
+            return false;
+        }
+        g_tls_cache.initialized = true;
+        g_tls_cache.pid = getpid();
+    } else if (g_tls_cache.pid != getpid()) {
+        pid_t cur = getpid();
+        int rc = mbedtls_ctr_drbg_reseed(&g_tls_cache.ctr_drbg, (const unsigned char *)&cur, sizeof(cur));
+        if (rc != 0) {
+            snprintf(err, err_n, "tls drbg reseed failed: -0x%04x", (unsigned)(-rc));
+            return false;
+        }
+        g_tls_cache.pid = cur;
+    }
+
+    const char *path = resolve_ca_bundle_path();
+    if (!path) {
+        snprintf(err, err_n, "unable to load CA certificate bundle");
+        return false;
+    }
+
+    if (!g_tls_cache.ca_loaded || strcmp(g_tls_cache.ca_path, path) != 0) {
+        mbedtls_x509_crt_free(&g_tls_cache.cacert);
+        mbedtls_x509_crt_init(&g_tls_cache.cacert);
+        g_tls_cache.ca_loaded = false;
+        g_tls_cache.ca_path[0] = '\0';
+
+        int rc = mbedtls_x509_crt_parse_file(&g_tls_cache.cacert, path);
+        if (rc < 0) {
+            mbedtls_x509_crt_free(&g_tls_cache.cacert);
+            mbedtls_x509_crt_init(&g_tls_cache.cacert);
+            snprintf(err, err_n, "unable to parse CA certificate bundle %s", path);
+            return false;
+        }
+        snprintf(g_tls_cache.ca_path, sizeof(g_tls_cache.ca_path), "%s", path);
+        g_tls_cache.ca_loaded = true;
+    }
+
+    return true;
 }
 
 static bool raw_send_all(int fd, const char *data, size_t len, int64_t deadline_ms, char *err, size_t err_n) {
@@ -297,29 +414,49 @@ static bool decode_chunked(const char *in, size_t in_len, sb_t *out) {
         }
         if (!crlf) return false;
         size_t line_len = (size_t)(crlf - (in + pos));
-        char hexbuf[64];
+        char hexbuf[32];
         size_t hlen = 0;
         for (size_t i = 0; i < line_len; i++) {
             char c = in[pos + i];
             if (c == ';' || c == ' ' || c == '\t') break;
-            if (hlen + 1 < sizeof(hexbuf)) hexbuf[hlen++] = c;
+            if (!isxdigit((unsigned char)c)) return false;
+            if (hlen + 1 >= sizeof(hexbuf)) return false;
+            hexbuf[hlen++] = c;
         }
         hexbuf[hlen] = '\0';
         if (hlen == 0) return false;
+        errno = 0;
         char *end = NULL;
-        unsigned long chunk_sz = strtoul(hexbuf, &end, 16);
-        if (!end || *end != '\0') return false;
+        unsigned long long chunk_sz = strtoull(hexbuf, &end, 16);
+        if (errno == ERANGE || !end || *end != '\0') return false;
         pos = (size_t)((crlf + 2) - in);
-        if (chunk_sz == 0) return true;
-        if (pos + chunk_sz > in_len) return false;
-        sb_putn(out, in + pos, chunk_sz);
-        pos += chunk_sz;
-        if (pos + 2 <= in_len && in[pos] == '\r' && in[pos + 1] == '\n') pos += 2;
+        if (chunk_sz == 0) {
+            if (in_len - pos >= 2 && in[pos] == '\r' && in[pos + 1] == '\n') {
+                return true;
+            }
+            for (size_t i = pos; i + 3 < in_len; i++) {
+                if (in[i] == '\r' && in[i + 1] == '\n' && in[i + 2] == '\r' && in[i + 3] == '\n') {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (chunk_sz > (unsigned long long)(in_len - pos)) return false;
+        if (chunk_sz > (unsigned long long)(HTTP_MAX_RESPONSE_BYTES - out->len)) return false;
+        sb_putn(out, in + pos, (size_t)chunk_sz);
+        pos += (size_t)chunk_sz;
+        if (in_len - pos < 2 || in[pos] != '\r' || in[pos + 1] != '\n') return false;
+        pos += 2;
     }
     return false;
 }
 
-static bool parse_http_response(const char *raw, size_t raw_len, http_resp_t *out, char *err, size_t err_n) {
+static bool parse_http_response(const char *raw,
+                                size_t raw_len,
+                                bool require_explicit_framing,
+                                http_resp_t *out,
+                                char *err,
+                                size_t err_n) {
     const char *sep = NULL;
     size_t sep_len = 0;
     for (size_t i = 0; i + 3 < raw_len; i++) {
@@ -377,7 +514,11 @@ static bool parse_http_response(const char *raw, size_t raw_len, http_resp_t *ou
         } else if (header_prefix_ci(line, "content-length")) {
             char *v = str_trim(line + 15);
             int64_t cl = -1;
-            if (str_to_i64(v, &cl) && cl >= 0) content_length = cl;
+            if (!str_to_i64(v, &cl) || cl < 0 || cl > HTTP_MAX_RESPONSE_BYTES) {
+                snprintf(err, err_n, "invalid Content-Length header");
+                return false;
+            }
+            content_length = cl;
         }
         if (!nl) break;
         p = nl + 1;
@@ -392,9 +533,18 @@ static bool parse_http_response(const char *raw, size_t raw_len, http_resp_t *ou
             return false;
         }
     } else if (content_length >= 0) {
-        size_t take = ((size_t)content_length < body_raw_len) ? (size_t)content_length : body_raw_len;
-        sb_putn(&body, body_start, take);
+        if ((uint64_t)content_length > (uint64_t)body_raw_len) {
+            sb_free(&body);
+            snprintf(err, err_n, "truncated HTTP response body");
+            return false;
+        }
+        sb_putn(&body, body_start, (size_t)content_length);
     } else {
+        if (require_explicit_framing) {
+            sb_free(&body);
+            snprintf(err, err_n, "unclean TLS close without Content-Length or chunked framing");
+            return false;
+        }
         sb_putn(&body, body_start, body_raw_len);
     }
 
@@ -413,8 +563,21 @@ bool http_request(const char *method,
                   char *err,
                   size_t err_n) {
     memset(out, 0, sizeof(*out));
+    const char *m = method ? method : "GET";
+    if (!m[0] || has_ctl_or_crlf(m) || strchr(m, ' ') != NULL) {
+        snprintf(err, err_n, "invalid HTTP method");
+        return false;
+    }
     parsed_url_t u;
     if (!parse_url(url, &u, err, err_n)) return false;
+
+    for (size_t i = 0; i < header_cnt; i++) {
+        if (!headers[i] || !*headers[i]) continue;
+        if (has_crlf(headers[i])) {
+            snprintf(err, err_n, "invalid character in HTTP header");
+            return false;
+        }
+    }
 
     int64_t tmo = (timeout_ms > 0) ? timeout_ms : 15000;
     int64_t deadline = now_ms() + tmo;
@@ -424,7 +587,7 @@ bool http_request(const char *method,
 
     sb_t req;
     sb_init(&req);
-    sb_printf(&req, "%s %s HTTP/1.1\r\n", method ? method : "GET", u.path);
+    sb_printf(&req, "%s %s HTTP/1.1\r\n", m, u.path);
     bool default_port = (u.is_https && u.port_num == 443) || (!u.is_https && u.port_num == 80);
     if (default_port) {
         sb_printf(&req, "Host: %s\r\n", u.host);
@@ -454,6 +617,7 @@ bool http_request(const char *method,
     sb_t raw;
     sb_init(&raw);
     bool ok = false;
+    bool require_explicit_framing = false;
 
     if (!u.is_https) {
         if (raw_send_all(fd, req.data, req.len, deadline, err, err_n)) {
@@ -461,6 +625,10 @@ bool http_request(const char *method,
             for (;;) {
                 ssize_t r = recv(fd, buf, sizeof(buf), 0);
                 if (r > 0) {
+                    if (raw.len + (size_t)r > HTTP_MAX_RESPONSE_BYTES) {
+                        snprintf(err, err_n, "http response exceeds maximum size");
+                        break;
+                    }
                     sb_putn(&raw, buf, (size_t)r);
                     continue;
                 }
@@ -486,42 +654,21 @@ bool http_request(const char *method,
             }
         }
     } else {
-        psa_status_t psa_rc = psa_crypto_init();
-        if (psa_rc != PSA_SUCCESS) {
-            snprintf(err, err_n, "psa_crypto_init failed: %d", (int)psa_rc);
-            sb_free(&req);
-            sb_free(&raw);
-            close(fd);
-            return false;
-        }
+        if (tls_cache_prepare(err, err_n)) {
+            mbedtls_ssl_context ssl;
+            mbedtls_ssl_config conf;
+            mbedtls_ssl_init(&ssl);
+            mbedtls_ssl_config_init(&conf);
 
-        mbedtls_ssl_context ssl;
-        mbedtls_ssl_config conf;
-        mbedtls_x509_crt cacert;
-        mbedtls_entropy_context entropy;
-        mbedtls_ctr_drbg_context ctr_drbg;
-
-        mbedtls_ssl_init(&ssl);
-        mbedtls_ssl_config_init(&conf);
-        mbedtls_x509_crt_init(&cacert);
-        mbedtls_entropy_init(&entropy);
-        mbedtls_ctr_drbg_init(&ctr_drbg);
-
-        const char *pers = "auth-router";
-        int rc = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                                       (const unsigned char *)pers, strlen(pers));
-        if (rc != 0) {
-            snprintf(err, err_n, "tls drbg seed failed: -0x%04x", (unsigned)(-rc));
-        } else if (load_ca_bundle(&cacert, err, err_n)) {
-            rc = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
-                                             MBEDTLS_SSL_TRANSPORT_STREAM,
-                                             MBEDTLS_SSL_PRESET_DEFAULT);
+            int rc = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                                 MBEDTLS_SSL_TRANSPORT_STREAM,
+                                                 MBEDTLS_SSL_PRESET_DEFAULT);
             if (rc != 0) {
                 snprintf(err, err_n, "tls config defaults failed: -0x%04x", (unsigned)(-rc));
             } else {
                 mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-                mbedtls_ssl_conf_ca_chain(&conf, &cacert, NULL);
-                mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+                mbedtls_ssl_conf_ca_chain(&conf, &g_tls_cache.cacert, NULL);
+                mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &g_tls_cache.ctr_drbg);
                 rc = mbedtls_ssl_setup(&ssl, &conf);
                 if (rc != 0) {
                     snprintf(err, err_n, "tls setup failed: -0x%04x", (unsigned)(-rc));
@@ -560,6 +707,10 @@ bool http_request(const char *method,
                             for (;;) {
                                 int r = mbedtls_ssl_read(&ssl, buf, sizeof(buf));
                                 if (r > 0) {
+                                    if (raw.len + (size_t)r > HTTP_MAX_RESPONSE_BYTES) {
+                                        snprintf(err, err_n, "http response exceeds maximum size");
+                                        break;
+                                    }
                                     sb_putn(&raw, (const char *)buf, (size_t)r);
                                     continue;
                                 }
@@ -572,7 +723,8 @@ bool http_request(const char *method,
                                     r == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
                                     continue;
                                 }
-                                if (raw.len > 0 && r == MBEDTLS_ERR_NET_CONN_RESET) {
+                                if (r == MBEDTLS_ERR_NET_CONN_RESET && raw.len > 0) {
+                                    require_explicit_framing = true;
                                     ok = true;
                                     break;
                                 }
@@ -586,13 +738,10 @@ bool http_request(const char *method,
                     }
                 }
             }
-        }
 
-        mbedtls_ssl_free(&ssl);
-        mbedtls_ssl_config_free(&conf);
-        mbedtls_x509_crt_free(&cacert);
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
+            mbedtls_ssl_free(&ssl);
+            mbedtls_ssl_config_free(&conf);
+        }
     }
 
     sb_free(&req);
@@ -602,7 +751,7 @@ bool http_request(const char *method,
         sb_free(&raw);
         return false;
     }
-    bool parsed = parse_http_response(raw.data, raw.len, out, err, err_n);
+    bool parsed = parse_http_response(raw.data, raw.len, require_explicit_framing, out, err, err_n);
     sb_free(&raw);
     return parsed;
 }
@@ -621,6 +770,7 @@ bool callback_open(const char *host, int port, int *sock_out, int *actual_port, 
         snprintf(err, err_n, "socket: %s", strerror(errno));
         return false;
     }
+    set_cloexec(fd);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in addr;
@@ -705,6 +855,13 @@ bool callback_wait(int sock,
         if (pfds[0].revents & POLLIN) {
             int cfd = accept(sock, NULL, NULL);
             if (cfd < 0) continue;
+            set_cloexec(cfd);
+            struct timeval tv;
+            tv.tv_sec = 5;
+            tv.tv_usec = 0;
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
             char req[4096];
             ssize_t r = read(cfd, req, sizeof(req) - 1);
             if (r > 0) {
@@ -729,7 +886,9 @@ bool callback_wait(int sock,
                                  "HTTP/1.1 %s\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",
                                  st, strlen(body), body);
                 if (n > 0) {
-                    ssize_t wr = write(cfd, resp, (size_t)n);
+                    size_t wlen = (size_t)n;
+                    if (wlen >= sizeof(resp)) wlen = sizeof(resp) - 1;
+                    ssize_t wr = write(cfd, resp, wlen);
                     (void)wr;
                 }
                 close(cfd);

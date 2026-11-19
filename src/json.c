@@ -138,7 +138,9 @@ static void skip_ws(jparse_t *jp) {
     while (*jp->p && (*jp->p == ' ' || *jp->p == '\t' || *jp->p == '\n' || *jp->p == '\r')) jp->p++;
 }
 
-static jval_t *parse_val(jparse_t *jp);
+#define JSON_MAX_DEPTH 64
+
+static jval_t *parse_val(jparse_t *jp, int depth);
 
 static char *parse_str_raw(jparse_t *jp) {
     if (*jp->p != '"') return NULL;
@@ -195,7 +197,8 @@ static char *parse_str_raw(jparse_t *jp) {
     return sb.data;
 }
 
-static jval_t *parse_val(jparse_t *jp) {
+static jval_t *parse_val(jparse_t *jp, int depth) {
+    if (depth > JSON_MAX_DEPTH) return NULL;
     skip_ws(jp);
     char c = *jp->p;
     if (!c) return NULL;
@@ -224,7 +227,7 @@ static jval_t *parse_val(jparse_t *jp) {
         skip_ws(jp);
         if (*jp->p == ']') { jp->p++; return a; }
         for (;;) {
-            jval_t *item = parse_val(jp);
+            jval_t *item = parse_val(jp, depth + 1);
             if (!item) { j_free(a); return NULL; }
             j_arr_push(a, item);
             skip_ws(jp);
@@ -246,7 +249,7 @@ static jval_t *parse_val(jparse_t *jp) {
             skip_ws(jp);
             if (*jp->p != ':') { free(k); j_free(o); return NULL; }
             jp->p++;
-            jval_t *v = parse_val(jp);
+            jval_t *v = parse_val(jp, depth + 1);
             if (!v) { free(k); j_free(o); return NULL; }
             j_obj_set(o, k, v);
             free(k);
@@ -290,7 +293,7 @@ static jval_t *parse_val(jparse_t *jp) {
 jval_t *j_parse(const char *src) {
     if (!src) return NULL;
     jparse_t jp = {src};
-    jval_t *v = parse_val(&jp);
+    jval_t *v = parse_val(&jp, 0);
     if (!v) return NULL;
     skip_ws(&jp);
     if (*jp.p != '\0') { j_free(v); return NULL; }

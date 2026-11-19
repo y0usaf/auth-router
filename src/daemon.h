@@ -5,12 +5,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #define AUTH_ROUTER_WIRE_VERSION 1
 
 typedef struct {
     const char *socket_path;
     const char *restricted_socket_path;
+    mode_t restricted_mode;
     const char *state_dir_path;
     bool no_bg_refresh;
 } daemon_cfg_t;

@@ -391,27 +391,45 @@ bool ak_put(const char *name, jval_t *entry, char *err, size_t err_n) {
         snprintf(err, err_n, "invalid credential name");
         return false;
     }
+    char lock_path[1088];
+    state_path("/auth.json.lock", lock_path, sizeof(lock_path));
+    int lfd = -1;
+    if (!file_lock(lock_path, &lfd, err, err_n)) {
+        j_free(entry);
+        return false;
+    }
     jval_t *root = NULL;
     if (!ak_read(&root, err, err_n)) {
+        file_unlock(lfd);
         j_free(entry);
         return false;
     }
     j_obj_set(root, name, entry);
     bool ok = ak_write(root, err, err_n);
     j_free(root);
+    file_unlock(lfd);
     return ok;
 }
 
 bool ak_remove(const char *name, char *err, size_t err_n) {
+    char lock_path[1088];
+    state_path("/auth.json.lock", lock_path, sizeof(lock_path));
+    int lfd = -1;
+    if (!file_lock(lock_path, &lfd, err, err_n)) return false;
     jval_t *root = NULL;
-    if (!ak_read(&root, err, err_n)) return false;
+    if (!ak_read(&root, err, err_n)) {
+        file_unlock(lfd);
+        return false;
+    }
     if (!j_obj_del(root, name)) {
         j_free(root);
+        file_unlock(lfd);
         snprintf(err, err_n, "no stored credential for %s", name);
         return false;
     }
     bool ok = ak_write(root, err, err_n);
     j_free(root);
+    file_unlock(lfd);
     return ok;
 }
 
@@ -933,6 +951,34 @@ bool auth_credentials(cred_list_t *out, char *err, size_t err_n) {
     j_free(ak);
     login_list_free(&logins);
     return ok;
+}
+
+bool auth_routable_credentials(cred_list_t *out, char *err, size_t err_n) {
+    memset(out, 0, sizeof(*out));
+    login_list_t logins = {0};
+    if (!auth_load(&logins, err, err_n)) return false;
+    cred_list_t all = {0};
+    if (!auth_credentials(&all, err, err_n)) {
+        login_list_free(&logins);
+        return false;
+    }
+    for (size_t i = 0; i < all.len; i++) {
+        if (strcmp(all.items[i].kind, "acp") == 0) continue;
+        if (strcmp(all.items[i].kind, "login") == 0) {
+            bool fin = false;
+            for (size_t j = 0; j < logins.len; j++) {
+                if (strcmp(logins.items[j].name, all.items[i].name) == 0 && logins.items[j].access[0]) {
+                    fin = true;
+                    break;
+                }
+            }
+            if (!fin) continue;
+        }
+        cred_list_push(out, all.items[i].name, all.items[i].provider, all.items[i].id, all.items[i].kind);
+    }
+    cred_list_free(&all);
+    login_list_free(&logins);
+    return true;
 }
 
 bool auth_provider_pool(const char *provider, cred_list_t *out, char *err, size_t err_n) {

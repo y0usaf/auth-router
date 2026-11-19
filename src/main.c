@@ -402,6 +402,16 @@ int main(int argc, char **argv) {
                 cfg.socket_path = rest_v[++i];
             } else if (strcmp(rest_v[i], "--restricted-socket") == 0 && i + 1 < rest_c) {
                 cfg.restricted_socket_path = rest_v[++i];
+            } else if (strcmp(rest_v[i], "--restricted-mode") == 0 && i + 1 < rest_c) {
+                const char *ms = rest_v[++i];
+                char *end = NULL;
+                unsigned long mv = strtoul(ms, &end, 8);
+                if (!ms[0] || !end || *end != '\0' || mv == 0 || mv > 0777) {
+                    snprintf(err, sizeof(err), "invalid octal mode for --restricted-mode: %s", ms);
+                    fail(err);
+                    return 1;
+                }
+                cfg.restricted_mode = (mode_t)mv;
             } else if (strcmp(rest_v[i], "--state-dir") == 0 && i + 1 < rest_c) {
                 cfg.state_dir_path = rest_v[++i];
             } else if (strcmp(rest_v[i], "--no-bg-refresh") == 0) {

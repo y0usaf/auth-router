@@ -5,6 +5,7 @@
 #include "policy.h"
 #include "store.h"
 #include "util.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -23,7 +24,15 @@
 #define MAX_CLIENTS 64
 #define MAX_JOBS 32
 #define MAX_WAITERS 64
-#define MAX_LINE_BYTES (256 * 1024)
+#define MAX_INBUF_BYTES (256 * 1024)
+#define MAX_OUTBUF_BYTES (1024 * 1024)
+#define MAX_JOB_RESULT_BYTES (1024 * 1024)
+#define CLIENT_IDLE_TIMEOUT_MS (30 * 1000)
+
+static void set_cloexec(int fd) {
+    int fl = fcntl(fd, F_GETFD, 0);
+    if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+}
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -328,8 +337,9 @@ static bool parse_routes_from_req(const jval_t *req, route_cand_t **out_routes, 
             snprintf(err, err_n, "token requires provider");
             return false;
         }
-        if (strlen(prov) > 64 || strlen(mod) > 64) {
-            snprintf(err, err_n, "psy policy route provider/model exceeds str[64] limit");
+        if (strlen(prov) >= sizeof(((route_cand_t *)0)->provider) ||
+            strlen(mod) >= sizeof(((route_cand_t *)0)->model)) {
+            snprintf(err, err_n, "route provider/model too long");
             return false;
         }
         route_cand_t *rc = calloc(1, sizeof(*rc));
@@ -361,9 +371,10 @@ static bool parse_routes_from_req(const jval_t *req, route_cand_t **out_routes, 
             snprintf(err, err_n, "route entry missing provider");
             return false;
         }
-        if (strlen(prov) > 64 || strlen(mod) > 64) {
+        if (strlen(prov) >= sizeof(rcs[i].provider) ||
+            strlen(mod) >= sizeof(rcs[i].model)) {
             free(rcs);
-            snprintf(err, err_n, "psy policy route provider/model exceeds str[64] limit");
+            snprintf(err, err_n, "route provider/model too long");
             return false;
         }
         int64_t rnk = (int64_t)i;
@@ -390,39 +401,22 @@ static bool eval_route_plan(const jval_t *req,
     size_t route_cnt = 0;
     if (!parse_routes_from_req(req, &routes, &route_cnt, err, err_n)) return false;
 
-    cred_list_t all_creds;
-    str_list_t order;
     cred_list_t ordered_creds;
     hold_list_t holds;
     unavail_list_t unavail;
 
-    if (!auth_credentials(&all_creds, err, err_n)) {
-        free(routes);
-        return false;
-    }
-    if (!auth_names(&order, err, err_n)) {
-        cred_list_free(&all_creds);
-        free(routes);
-        return false;
-    }
-    if (!auth_credential_pick(&order, &all_creds, &ordered_creds, err, err_n)) {
-        str_list_free(&order);
-        cred_list_free(&all_creds);
+    if (!auth_routable_credentials(&ordered_creds, err, err_n)) {
         free(routes);
         return false;
     }
     if (!auth_holds(&holds, err, err_n)) {
         cred_list_free(&ordered_creds);
-        str_list_free(&order);
-        cred_list_free(&all_creds);
         free(routes);
         return false;
     }
     if (!auth_models(&unavail, err, err_n)) {
         hold_list_free(&holds);
         cred_list_free(&ordered_creds);
-        str_list_free(&order);
-        cred_list_free(&all_creds);
         free(routes);
         return false;
     }
@@ -462,8 +456,6 @@ static bool eval_route_plan(const jval_t *req,
     unavail_list_free(&unavail);
     hold_list_free(&holds);
     cred_list_free(&ordered_creds);
-    str_list_free(&order);
-    cred_list_free(&all_creds);
     free(routes);
     return ok;
 }
@@ -746,24 +738,27 @@ jval_t *router_exec_direct(const jval_t *req, bool restricted) {
         policy_res_t pres;
         cred_t cred;
         bool has_cred = false;
-        if (!eval_route_plan(req, &pres, &cred, &has_cred, err, sizeof(err))) {
-            res = make_err(err);
-        } else {
-            res = build_route_response(&pres, &cred, has_cred, true, err, sizeof(err));
-            if (!res) res = make_err(err);
-            cred_single_free(&cred);
+        bool plan_ok = eval_route_plan(req, &pres, &cred, &has_cred, err, sizeof(err));
+        file_unlock(lfd);
+        if (!plan_ok) {
+            return make_err(err);
         }
-    } else {
-        res = exec_non_route_op(req, 0, false);
+        res = build_route_response(&pres, &cred, has_cred, true, err, sizeof(err));
+        if (!res) res = make_err(err);
+        cred_single_free(&cred);
+        return res;
     }
-
+    res = exec_non_route_op(req, 0, false);
     file_unlock(lfd);
     return res;
 }
 
 typedef struct {
     int fd;
+    uint64_t conn_id;
     bool restricted;
+    bool eof_read;
+    int64_t last_activity_ms;
     sb_t inbuf;
     sb_t outbuf;
     size_t out_off;
@@ -772,6 +767,7 @@ typedef struct {
 
 typedef struct {
     int client_idx;
+    uint64_t conn_id;
     policy_res_t pres;
     cred_t cred;
 } refresh_waiter_t;
@@ -790,7 +786,10 @@ typedef struct {
 static void client_close(client_t *c) {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
+    c->conn_id = 0;
     c->restricted = false;
+    c->eof_read = false;
+    c->last_activity_ms = 0;
     c->waiting_refresh = false;
     c->out_off = 0;
     sb_free(&c->inbuf);
@@ -798,11 +797,40 @@ static void client_close(client_t *c) {
 }
 
 static void client_queue_json(client_t *c, const jval_t *v) {
+    if (c->fd < 0) return;
     char *s = j_show(v);
     if (s) {
-        sb_puts(&c->outbuf, s);
+        size_t slen = strlen(s);
+        if (c->outbuf.len + slen + 1 > MAX_OUTBUF_BYTES) {
+            free(s);
+            client_close(c);
+            return;
+        }
+        sb_putn(&c->outbuf, s, slen);
         sb_putc(&c->outbuf, '\n');
         free(s);
+    }
+}
+
+static void close_inherited_fds_except(int keep_fd) {
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        int dfd = dirfd(d);
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            int fd = atoi(de->d_name);
+            if (fd > 2 && fd != keep_fd && fd != dfd) {
+                close(fd);
+            }
+        }
+        closedir(d);
+        return;
+    }
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
+    for (int fd = 3; fd < (int)max_fd; fd++) {
+        if (fd != keep_fd) close(fd);
     }
 }
 
@@ -833,6 +861,8 @@ static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *
         snprintf(err, err_n, "pipe: %s", strerror(errno));
         return -1;
     }
+    set_cloexec(pfd[0]);
+    set_cloexec(pfd[1]);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -843,7 +873,9 @@ static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *
     }
 
     if (pid == 0) {
-        close(pfd[0]);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        close_inherited_fds_except(pfd[1]);
         jval_t *out = j_obj();
         char werr[512];
         werr[0] = '\0';
@@ -937,7 +969,9 @@ static void finish_refresh_job(refresh_job_t *job, client_t *clients) {
 
     for (size_t i = 0; i < job->waiter_cnt; i++) {
         refresh_waiter_t *w = &job->waiters[i];
-        if (w->client_idx >= 0 && w->client_idx < MAX_CLIENTS && clients[w->client_idx].fd >= 0) {
+        if (w->client_idx >= 0 && w->client_idx < MAX_CLIENTS &&
+            clients[w->client_idx].fd >= 0 &&
+            clients[w->client_idx].conn_id == w->conn_id) {
             client_t *c = &clients[w->client_idx];
             c->waiting_refresh = false;
             if (ok) {
@@ -1009,7 +1043,7 @@ static void trigger_bg_refreshes(refresh_job_t *jobs, int64_t lead_ms) {
     }
 }
 
-static int open_unix_listener(const char *path, char *err, size_t err_n) {
+static int open_unix_listener(const char *path, mode_t sock_mode, char *err, size_t err_n) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -1019,18 +1053,22 @@ static int open_unix_listener(const char *path, char *err, size_t err_n) {
     }
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 
+    mode_t m = sock_mode ? sock_mode : 0600;
+    mode_t dir_mode = (m & 0077) ? 0755 : 0700;
+
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
     if (slash && slash != dir) {
         *slash = '\0';
-        ensure_dir(dir, 0700);
+        ensure_dir(dir, dir_mode);
     }
 
     struct stat st;
     if (lstat(path, &st) == 0) {
         int probe = socket(AF_UNIX, SOCK_STREAM, 0);
         if (probe >= 0) {
+            set_cloexec(probe);
             if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
                 close(probe);
                 snprintf(err, err_n, "daemon already running on %s", path);
@@ -1046,6 +1084,7 @@ static int open_unix_listener(const char *path, char *err, size_t err_n) {
         snprintf(err, err_n, "socket: %s", strerror(errno));
         return -1;
     }
+    set_cloexec(fd);
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 
@@ -1057,7 +1096,7 @@ static int open_unix_listener(const char *path, char *err, size_t err_n) {
         close(fd);
         return -1;
     }
-    chmod(path, 0600);
+    chmod(path, m);
     if (listen(fd, 32) != 0) {
         snprintf(err, err_n, "listen %s: %s", path, strerror(errno));
         close(fd);
@@ -1132,6 +1171,7 @@ static void handle_client_line(client_t *clients,
             if (jidx >= 0 && jobs[jidx].waiter_cnt < MAX_WAITERS) {
                 refresh_waiter_t *w = &jobs[jidx].waiters[jobs[jidx].waiter_cnt++];
                 w->client_idx = cidx;
+                w->conn_id = c->conn_id;
                 w->pres = pres;
                 w->cred = cred;
                 c->waiting_refresh = true;
@@ -1175,7 +1215,7 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
 
     char lock_path[1088];
     state_path("/daemon.lock", lock_path, sizeof(lock_path));
-    int lock_fd = open(lock_path, O_RDWR | O_CREAT, 0600);
+    int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock_fd < 0) {
         snprintf(err, err_n, "open %s: %s", lock_path, strerror(errno));
         return 1;
@@ -1193,11 +1233,10 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
         daemon_default_socket(sock_path, sizeof(sock_path));
     }
 
-    int primary_fd = open_unix_listener(sock_path, err, err_n);
+    int primary_fd = open_unix_listener(sock_path, 0600, err, err_n);
     if (primary_fd < 0) {
         flock(lock_fd, LOCK_UN);
         close(lock_fd);
-        unlink(lock_path);
         return 1;
     }
 
@@ -1209,13 +1248,13 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                             : getenv("AUTH_ROUTER_RESTRICTED_SOCKET");
     if (rpath && *rpath) {
         snprintf(rsock_path, sizeof(rsock_path), "%s", rpath);
-        restricted_fd = open_unix_listener(rsock_path, err, err_n);
+        mode_t rmode = cfg->restricted_mode ? cfg->restricted_mode : 0600;
+        restricted_fd = open_unix_listener(rsock_path, rmode, err, err_n);
         if (restricted_fd < 0) {
             close(primary_fd);
             unlink(sock_path);
             flock(lock_fd, LOCK_UN);
             close(lock_fd);
-            unlink(lock_path);
             return 1;
         }
     }
@@ -1245,9 +1284,14 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
     if (env_chk && *env_chk) str_to_i64(env_chk, &bg_check_ms);
     const char *env_lead = getenv("AUTH_ROUTER_BG_LEAD_MS");
     if (env_lead && *env_lead) str_to_i64(env_lead, &bg_lead_ms);
+    int64_t idle_timeout_ms = CLIENT_IDLE_TIMEOUT_MS;
+    const char *env_idle = getenv("AUTH_ROUTER_CLIENT_IDLE_MS");
+    if (env_idle && *env_idle) str_to_i64(env_idle, &idle_timeout_ms);
     int64_t last_bg = started_ms;
+    uint64_t next_conn_id = 1;
 
     while (!g_stop) {
+        int64_t loop_now = now_ms();
         struct pollfd pfds[2 + MAX_CLIENTS + MAX_JOBS];
         int pmap_kind[2 + MAX_CLIENTS + MAX_JOBS];
         int pmap_idx[2 + MAX_CLIENTS + MAX_JOBS];
@@ -1271,8 +1315,19 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
 
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].fd < 0) continue;
+            if (clients[i].eof_read && !clients[i].waiting_refresh && clients[i].out_off >= clients[i].outbuf.len) {
+                client_close(&clients[i]);
+                continue;
+            }
+            if (idle_timeout_ms > 0 && !clients[i].waiting_refresh &&
+                clients[i].out_off >= clients[i].outbuf.len &&
+                loop_now - clients[i].last_activity_ms > idle_timeout_ms) {
+                client_close(&clients[i]);
+                continue;
+            }
             pfds[nfds].fd = clients[i].fd;
-            pfds[nfds].events = POLLIN;
+            pfds[nfds].events = 0;
+            if (!clients[i].eof_read) pfds[nfds].events |= POLLIN;
             if (clients[i].out_off < clients[i].outbuf.len) pfds[nfds].events |= POLLOUT;
             pfds[nfds].revents = 0;
             pmap_kind[nfds] = 2;
@@ -1306,6 +1361,7 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                 for (;;) {
                     int cfd = accept(lfd, NULL, NULL);
                     if (cfd < 0) break;
+                    set_cloexec(cfd);
                     int fl = fcntl(cfd, F_GETFL, 0);
                     if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
                     int slot = -1;
@@ -1320,7 +1376,10 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                         continue;
                     }
                     clients[slot].fd = cfd;
+                    clients[slot].conn_id = next_conn_id++;
                     clients[slot].restricted = (kind == 1);
+                    clients[slot].eof_read = false;
+                    clients[slot].last_activity_ms = now_ms();
                     clients[slot].waiting_refresh = false;
                     clients[slot].out_off = 0;
                     sb_init(&clients[slot].inbuf);
@@ -1337,13 +1396,14 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                     char buf[4096];
                     ssize_t r = read(c->fd, buf, sizeof(buf));
                     if (r > 0) {
-                        sb_putn(&c->inbuf, buf, (size_t)r);
-                        if (c->inbuf.len > MAX_LINE_BYTES) {
+                        c->last_activity_ms = now_ms();
+                        if (c->inbuf.len + (size_t)r > MAX_INBUF_BYTES) {
                             client_close(c);
                             continue;
                         }
+                        sb_putn(&c->inbuf, buf, (size_t)r);
                         char *nl = NULL;
-                        while (!c->waiting_refresh && c->inbuf.data &&
+                        while (c->fd >= 0 && !c->waiting_refresh && c->inbuf.data &&
                                (nl = memchr(c->inbuf.data, '\n', c->inbuf.len)) != NULL) {
                             size_t llen = (size_t)(nl - c->inbuf.data);
                             char *line = malloc(llen + 1);
@@ -1357,6 +1417,7 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                             free(line);
                         }
                     } else if (r == 0) {
+                        c->eof_read = true;
                         if (!c->waiting_refresh && c->out_off >= c->outbuf.len) {
                             client_close(c);
                             continue;
@@ -1369,11 +1430,15 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                 if (c->fd >= 0 && (pfds[k].revents & POLLOUT) && c->out_off < c->outbuf.len) {
                     ssize_t w = write(c->fd, c->outbuf.data + c->out_off, c->outbuf.len - c->out_off);
                     if (w > 0) {
+                        c->last_activity_ms = now_ms();
                         c->out_off += (size_t)w;
                         if (c->out_off >= c->outbuf.len) {
                             c->outbuf.len = 0;
                             c->out_off = 0;
                             if (c->outbuf.data) c->outbuf.data[0] = '\0';
+                            if (c->eof_read && !c->waiting_refresh) {
+                                client_close(c);
+                            }
                         }
                     } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                         client_close(c);
@@ -1387,6 +1452,11 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                 for (;;) {
                     ssize_t r = read(j->pipe_fd, buf, sizeof(buf));
                     if (r > 0) {
+                        if (j->result_buf.len + (size_t)r > MAX_JOB_RESULT_BYTES) {
+                            sb_free(&j->result_buf);
+                            done = true;
+                            break;
+                        }
                         sb_putn(&j->result_buf, buf, (size_t)r);
                         continue;
                     }
@@ -1438,7 +1508,6 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
     }
     flock(lock_fd, LOCK_UN);
     close(lock_fd);
-    unlink(lock_path);
     return 0;
 }
 
@@ -1469,6 +1538,7 @@ daemon_rpc_status_t daemon_rpc(const char *sock_path,
         snprintf(err, err_n, "socket: %s", strerror(errno));
         return DAEMON_RPC_ERR;
     }
+    set_cloexec(fd);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         int e = errno;
         close(fd);
@@ -1529,6 +1599,12 @@ daemon_rpc_status_t daemon_rpc(const char *sock_path,
         char buf[4096];
         ssize_t r = read(fd, buf, sizeof(buf));
         if (r > 0) {
+            if (in.len + (size_t)r > MAX_OUTBUF_BYTES) {
+                snprintf(err, err_n, "daemon response exceeds maximum size");
+                sb_free(&in);
+                close(fd);
+                return DAEMON_RPC_ERR;
+            }
             sb_putn(&in, buf, (size_t)r);
             if (memchr(in.data, '\n', in.len) != NULL) break;
         } else if (r == 0) {

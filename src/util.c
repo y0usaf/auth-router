@@ -191,7 +191,7 @@ void base64url_encode(const uint8_t *in, size_t len, char *out) {
 }
 
 bool random_bytes(uint8_t *out, size_t len) {
-    int fd = open("/dev/urandom", O_RDONLY);
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
     size_t got = 0;
     while (got < len) {
@@ -434,7 +434,7 @@ bool file_read(const char *path, char **out, size_t *out_len, bool *not_found) {
     if (not_found) *not_found = false;
     *out = NULL;
     if (out_len) *out_len = 0;
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT && not_found) *not_found = true;
         return false;
@@ -469,7 +469,7 @@ bool file_write_0600(const char *path, const char *data, size_t len) {
     }
     char tmp[1088];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return false;
     fchmod(fd, 0600);
     size_t off = 0;
@@ -508,7 +508,7 @@ bool file_lock(const char *path, int *fd_out, char *err, size_t err_n) {
         *slash = '\0';
         ensure_dir(dir, 0700);
     }
-    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) {
         snprintf(err, err_n, "%s: %s", path, strerror(errno));
         return false;

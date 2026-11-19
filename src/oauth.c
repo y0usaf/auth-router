@@ -246,13 +246,16 @@ bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
         out->verifier = xstrdup(l->verifier);
         return true;
     }
-    char lock_path[1024];
+
+    char lock_path[1088];
     state_path("/logins.lock", lock_path, sizeof(lock_path));
     int fd = -1;
     if (!file_lock(lock_path, &fd, err, err_n)) return false;
 
     login_list_t cur = {0};
     bool ok = auth_load(&cur, err, err_n);
+    bool already_fresh = false;
+    char *refresh_tok = NULL;
     if (ok) {
         login_t *found = NULL;
         for (size_t i = 0; i < cur.len; i++) {
@@ -270,33 +273,73 @@ bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
             out->refresh = xstrdup(found->refresh);
             out->expires = found->expires;
             out->verifier = xstrdup(found->verifier);
+            already_fresh = true;
         } else {
-            jval_t *p = j_obj();
-            j_obj_set(p, "grant_type", j_str("refresh_token"));
-            j_obj_set(p, "client_id", j_str(AUTH_CLIENT_ID));
-            j_obj_set(p, "refresh_token", j_str(found->refresh));
-            char what[256];
-            snprintf(what, sizeof(what), "login %s refresh", found->name);
-            char *acc = NULL, *ref = NULL;
-            int64_t exp = 0;
-            ok = auth_token_call(what, p, &acc, &ref, &exp, err, err_n);
-            j_free(p);
-            if (ok) {
-                free(found->access);
-                free(found->refresh);
-                found->access = acc;
-                found->refresh = ref;
-                found->expires = exp;
-                ok = auth_save(&cur, err, err_n);
-                if (ok) {
-                    out->name = xstrdup(found->name);
-                    out->access = xstrdup(found->access);
-                    out->refresh = xstrdup(found->refresh);
-                    out->expires = found->expires;
-                    out->verifier = xstrdup(found->verifier);
-                }
+            refresh_tok = xstrdup(found->refresh);
+        }
+    }
+    login_list_free(&cur);
+    file_unlock(fd);
+
+    if (!ok || already_fresh) {
+        free(refresh_tok);
+        return ok;
+    }
+
+    jval_t *p = j_obj();
+    j_obj_set(p, "grant_type", j_str("refresh_token"));
+    j_obj_set(p, "client_id", j_str(AUTH_CLIENT_ID));
+    j_obj_set(p, "refresh_token", j_str(refresh_tok));
+    free(refresh_tok);
+    char what[256];
+    snprintf(what, sizeof(what), "login %s refresh", l->name);
+    char *acc = NULL;
+    char *ref = NULL;
+    int64_t exp = 0;
+    ok = auth_token_call(what, p, &acc, &ref, &exp, err, err_n);
+    j_free(p);
+    if (!ok) return false;
+
+    fd = -1;
+    if (!file_lock(lock_path, &fd, err, err_n)) {
+        free(acc);
+        free(ref);
+        return false;
+    }
+
+    memset(&cur, 0, sizeof(cur));
+    ok = auth_load(&cur, err, err_n);
+    if (ok) {
+        login_t *found = NULL;
+        for (size_t i = 0; i < cur.len; i++) {
+            if (strcmp(cur.items[i].name, l->name) == 0) {
+                found = &cur.items[i];
+                break;
             }
         }
+        if (!found) {
+            snprintf(err, err_n, "login %s was removed while refreshing", l->name);
+            free(acc);
+            free(ref);
+            ok = false;
+        } else {
+            free(found->access);
+            free(found->refresh);
+            found->access = acc;
+            found->refresh = ref;
+            found->expires = exp;
+            ok = auth_save(&cur, err, err_n);
+            if (ok) {
+                out->name = xstrdup(found->name);
+                out->access = xstrdup(found->access);
+                out->refresh = xstrdup(found->refresh);
+                out->expires = found->expires;
+                out->verifier = xstrdup(found->verifier);
+            }
+        }
+    } else {
+        free(acc);
+        free(ref);
     }
     login_list_free(&cur);
     file_unlock(fd);

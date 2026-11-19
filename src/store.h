@@ -118,6 +118,7 @@ void auth_line(const login_t *l, const hold_list_t *holds, int64_t now, sb_t *ou
 
 bool auth_rank(const str_list_t *names, const login_list_t *logins, login_list_t *out, char *err, size_t err_n);
 bool auth_credentials(cred_list_t *out, char *err, size_t err_n);
+bool auth_routable_credentials(cred_list_t *out, char *err, size_t err_n);
 bool auth_provider_pool(const char *provider, cred_list_t *out, char *err, size_t err_n);
 bool auth_credential_pick(const str_list_t *names, const cred_list_t *pool, cred_list_t *out, char *err, size_t err_n);
 

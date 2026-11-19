@@ -8,8 +8,8 @@
 
 typedef struct {
     int64_t rank;
-    char provider[65];
-    char model[65];
+    char provider[128];
+    char model[128];
 } route_cand_t;
 
 typedef struct {
