@@ -180,6 +180,17 @@ static bool auth_token_call(const char *what, const jval_t *payload, char **acce
     return true;
 }
 
+static bool order_append_cb(const str_list_t *cur, str_list_t *next, void *ctx, char *err, size_t err_n) {
+    const char *name = (const char *)ctx;
+    (void)err;
+    (void)err_n;
+    for (size_t i = 0; i < cur->len; i++) {
+        if (strcmp(cur->items[i], name) != 0) str_list_push(next, cur->items[i]);
+    }
+    str_list_push(next, name);
+    return true;
+}
+
 bool auth_complete(const login_t *current, const char *code, const char *state, const char *redirect, bool quiet, char *err, size_t err_n) {
     if (strcmp(state, current->verifier) != 0) {
         snprintf(err, err_n, "OAuth state mismatch; run crest-auth login again and use the newest link");
@@ -210,17 +221,7 @@ bool auth_complete(const login_t *current, const char *code, const char *state, 
     auth_id_for_login(current->name, id, sizeof(id));
     auth_forget(id, err, err_n);
 
-    str_list_t names = {0};
-    if (auth_names(&names, err, err_n)) {
-        str_list_t next = {0};
-        for (size_t i = 0; i < names.len; i++) {
-            if (strcmp(names.items[i], current->name) != 0) str_list_push(&next, names.items[i]);
-        }
-        str_list_push(&next, current->name);
-        auth_write_names(&next, err, err_n);
-        str_list_free(&next);
-        str_list_free(&names);
-    }
+    auth_order_update(order_append_cb, (void *)current->name, err, err_n);
 
     if (!quiet) {
         hold_list_t empty = {0};

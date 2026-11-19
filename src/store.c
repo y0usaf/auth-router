@@ -326,7 +326,7 @@ bool auth_names(str_list_t *out, char *err, size_t err_n) {
     return true;
 }
 
-bool auth_write_names(const str_list_t *names, char *err, size_t err_n) {
+static bool auth_write_names_unlocked(const str_list_t *names, char *err, size_t err_n) {
     for (size_t i = 0; i < names->len; i++) {
         const char *n = names->items[i];
         if (!n || !n[0] || strchr(n, '\n') || strchr(n, '\r')) {
@@ -340,10 +340,6 @@ bool auth_write_names(const str_list_t *names, char *err, size_t err_n) {
             }
         }
     }
-    char lock_path[1024];
-    state_path("/order.lock", lock_path, sizeof(lock_path));
-    int fd = -1;
-    if (!file_lock(lock_path, &fd, err, err_n)) return false;
     sb_t sb;
     sb_init(&sb);
     for (size_t i = 0; i < names->len; i++) {
@@ -353,6 +349,31 @@ bool auth_write_names(const str_list_t *names, char *err, size_t err_n) {
     sb_putc(&sb, '\n');
     bool ok = state_write_text("/order", sb.data, sb.len, err, err_n);
     sb_free(&sb);
+    return ok;
+}
+
+bool auth_write_names(const str_list_t *names, char *err, size_t err_n) {
+    char lock_path[1024];
+    state_path("/order.lock", lock_path, sizeof(lock_path));
+    int fd = -1;
+    if (!file_lock(lock_path, &fd, err, err_n)) return false;
+    bool ok = auth_write_names_unlocked(names, err, err_n);
+    file_unlock(fd);
+    return ok;
+}
+
+bool auth_order_update(auth_order_fn fn, void *ctx, char *err, size_t err_n) {
+    char lock_path[1024];
+    state_path("/order.lock", lock_path, sizeof(lock_path));
+    int fd = -1;
+    if (!file_lock(lock_path, &fd, err, err_n)) return false;
+    str_list_t cur = {0};
+    str_list_t next = {0};
+    bool ok = auth_names(&cur, err, err_n);
+    if (ok) ok = fn(&cur, &next, ctx, err, err_n);
+    if (ok) ok = auth_write_names_unlocked(&next, err, err_n);
+    str_list_free(&next);
+    str_list_free(&cur);
     file_unlock(fd);
     return ok;
 }

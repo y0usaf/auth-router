@@ -496,6 +496,109 @@ static jval_t *build_route_response(const policy_res_t *pres, const cred_t *cred
     return res;
 }
 
+typedef struct {
+    const char *op;
+    const jval_t *req;
+} order_set_ctx_t;
+
+typedef struct {
+    const char *prov;
+    char rotated[256];
+} order_rotate_ctx_t;
+
+static bool order_remove_cb(const str_list_t *cur, str_list_t *next, void *ctx, char *err, size_t err_n) {
+    const char *name = (const char *)ctx;
+    (void)err;
+    (void)err_n;
+    for (size_t i = 0; i < cur->len; i++) {
+        if (strcmp(cur->items[i], name) != 0) str_list_push(next, cur->items[i]);
+    }
+    return true;
+}
+
+static bool order_set_cb(const str_list_t *cur, str_list_t *next, void *ctx, char *err, size_t err_n) {
+    order_set_ctx_t *c = (order_set_ctx_t *)ctx;
+    cred_list_t all = {0};
+    if (!auth_credentials(&all, err, err_n)) return false;
+    str_list_t known = {0};
+    for (size_t i = 0; i < all.len; i++) {
+        str_list_push(&known, all.items[i].name);
+    }
+    cred_list_free(&all);
+
+    if (strcmp(c->op, "top") == 0) {
+        const char *n = j_str_at(c->req, "name");
+        if (!n[0] || strchr(n, '\n') || strchr(n, '\r') || !str_list_has(&known, n)) {
+            str_list_free(&known);
+            snprintf(err, err_n, "top requires a known credential name");
+            return false;
+        }
+        str_list_push(next, n);
+    } else {
+        jval_t *names_arr = j_obj_get(c->req, "names");
+        if (!names_arr || names_arr->type != J_ARR || names_arr->arr_len == 0) {
+            str_list_free(&known);
+            snprintf(err, err_n, "order requires names array");
+            return false;
+        }
+        for (size_t i = 0; i < names_arr->arr_len; i++) {
+            const jval_t *item = names_arr->arr[i];
+            if (!item || item->type != J_STR || !item->s[0] ||
+                strchr(item->s, '\n') || strchr(item->s, '\r')) {
+                str_list_free(&known);
+                snprintf(err, err_n, "order contains invalid credential name");
+                return false;
+            }
+            if (!str_list_has(&known, item->s)) {
+                snprintf(err, err_n, "unknown credential name: %s", item->s);
+                str_list_free(&known);
+                return false;
+            }
+            if (str_list_has(next, item->s)) {
+                snprintf(err, err_n, "duplicate credential name: %s", item->s);
+                str_list_free(&known);
+                return false;
+            }
+            str_list_push(next, item->s);
+        }
+    }
+    for (size_t i = 0; i < cur->len; i++) {
+        if (str_list_has(&known, cur->items[i]) && !str_list_has(next, cur->items[i])) {
+            str_list_push(next, cur->items[i]);
+        }
+    }
+    str_list_free(&known);
+    return true;
+}
+
+static bool order_rotate_cb(const str_list_t *cur, str_list_t *next, void *ctx, char *err, size_t err_n) {
+    order_rotate_ctx_t *c = (order_rotate_ctx_t *)ctx;
+    cred_list_t all = {0};
+    cred_list_t picked = {0};
+    if (!auth_credentials(&all, err, err_n)) return false;
+    if (!auth_credential_pick(cur, &all, &picked, err, err_n)) {
+        cred_list_free(&all);
+        return false;
+    }
+    const char *first_match = NULL;
+    for (size_t i = 0; i < picked.len; i++) {
+        if (c->prov[0] && strcmp(picked.items[i].provider, c->prov) != 0) {
+            str_list_push(next, picked.items[i].name);
+        } else if (!first_match) {
+            first_match = picked.items[i].name;
+        } else {
+            str_list_push(next, picked.items[i].name);
+        }
+    }
+    if (first_match) {
+        str_list_push(next, first_match);
+        snprintf(c->rotated, sizeof(c->rotated), "%s", first_match);
+    }
+    cred_list_free(&picked);
+    cred_list_free(&all);
+    return true;
+}
+
 static jval_t *exec_non_route_op(const jval_t *req, int64_t started_ms, bool bg_refresh) {
     const char *op = j_str_at(req, "op");
     char err[512];
@@ -586,117 +689,25 @@ static jval_t *exec_non_route_op(const jval_t *req, int64_t started_ms, bool bg_
             if (!ak_remove(name, err, sizeof(err))) return make_err(err);
             auth_forget(cid, err, sizeof(err));
         }
-        str_list_t ord = {0};
-        if (auth_names(&ord, err, sizeof(err)) && ord.len > 0) {
-            str_list_t kept = {0};
-            for (size_t i = 0; i < ord.len; i++) {
-                if (strcmp(ord.items[i], name) != 0) str_list_push(&kept, ord.items[i]);
-            }
-            auth_write_names(&kept, err, sizeof(err));
-            str_list_free(&kept);
-            str_list_free(&ord);
-        }
+        auth_order_update(order_remove_cb, (void *)name, err, sizeof(err));
         jval_t *r = make_ok();
         j_obj_set(r, "removed", j_str(name));
         return r;
     }
 
     if (strcmp(op, "order") == 0 || strcmp(op, "top") == 0) {
-        cred_list_t all = {0};
-        if (!auth_credentials(&all, err, sizeof(err))) return make_err(err);
-        str_list_t known = {0};
-        for (size_t i = 0; i < all.len; i++) {
-            str_list_push(&known, all.items[i].name);
-        }
-        cred_list_free(&all);
-
-        jval_t *names_arr = j_obj_get(req, "names");
-        str_list_t names = {0};
-        if (strcmp(op, "top") == 0) {
-            const char *n = j_str_at(req, "name");
-            if (!n[0] || strchr(n, '\n') || strchr(n, '\r') || !str_list_has(&known, n)) {
-                str_list_free(&known);
-                return make_err("top requires a known credential name");
-            }
-            str_list_push(&names, n);
-        } else {
-            if (!names_arr || names_arr->type != J_ARR || names_arr->arr_len == 0) {
-                str_list_free(&known);
-                return make_err("order requires names array");
-            }
-            for (size_t i = 0; i < names_arr->arr_len; i++) {
-                const jval_t *item = names_arr->arr[i];
-                if (!item || item->type != J_STR || !item->s[0] ||
-                    strchr(item->s, '\n') || strchr(item->s, '\r')) {
-                    str_list_free(&names);
-                    str_list_free(&known);
-                    return make_err("order contains invalid credential name");
-                }
-                if (!str_list_has(&known, item->s)) {
-                    snprintf(err, sizeof(err), "unknown credential name: %s", item->s);
-                    str_list_free(&names);
-                    str_list_free(&known);
-                    return make_err(err);
-                }
-                if (str_list_has(&names, item->s)) {
-                    snprintf(err, sizeof(err), "duplicate credential name: %s", item->s);
-                    str_list_free(&names);
-                    str_list_free(&known);
-                    return make_err(err);
-                }
-                str_list_push(&names, item->s);
-            }
-        }
-        str_list_t cur = {0};
-        if (auth_names(&cur, err, sizeof(err))) {
-            for (size_t i = 0; i < cur.len; i++) {
-                if (str_list_has(&known, cur.items[i]) && !str_list_has(&names, cur.items[i])) {
-                    str_list_push(&names, cur.items[i]);
-                }
-            }
-            str_list_free(&cur);
-        }
-        str_list_free(&known);
-        bool ok = auth_write_names(&names, err, sizeof(err));
-        str_list_free(&names);
-        if (!ok) return make_err(err);
+        order_set_ctx_t ctx = { .op = op, .req = req };
+        if (!auth_order_update(order_set_cb, &ctx, err, sizeof(err))) return make_err(err);
         return make_ok();
     }
 
     if (strcmp(op, "rotate") == 0) {
-        const char *prov = j_str_at(req, "provider");
-        cred_list_t all = {0};
-        str_list_t cur = {0};
-        cred_list_t picked = {0};
-        if (!auth_credentials(&all, err, sizeof(err))) return make_err(err);
-        if (!auth_names(&cur, err, sizeof(err))) {
-            cred_list_free(&all);
-            return make_err(err);
-        }
-        if (!auth_credential_pick(&cur, &all, &picked, err, sizeof(err))) {
-            str_list_free(&cur);
-            cred_list_free(&all);
-            return make_err(err);
-        }
-        str_list_t next_order = {0};
-        const char *first_match = NULL;
-        for (size_t i = 0; i < picked.len; i++) {
-            if (prov[0] && strcmp(picked.items[i].provider, prov) != 0) {
-                str_list_push(&next_order, picked.items[i].name);
-            } else if (!first_match) {
-                first_match = picked.items[i].name;
-            } else {
-                str_list_push(&next_order, picked.items[i].name);
-            }
-        }
-        if (first_match) str_list_push(&next_order, first_match);
-        bool ok = auth_write_names(&next_order, err, sizeof(err));
-        jval_t *r = ok ? make_ok() : make_err(err);
-        if (ok && first_match) j_obj_set(r, "rotated", j_str(first_match));
-        str_list_free(&next_order);
-        cred_list_free(&picked);
-        str_list_free(&cur);
-        cred_list_free(&all);
+        order_rotate_ctx_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.prov = j_str_at(req, "provider");
+        if (!auth_order_update(order_rotate_cb, &ctx, err, sizeof(err))) return make_err(err);
+        jval_t *r = make_ok();
+        if (ctx.rotated[0]) j_obj_set(r, "rotated", j_str(ctx.rotated));
         return r;
     }
 

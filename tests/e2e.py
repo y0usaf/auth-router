@@ -1,4 +1,5 @@
 import concurrent.futures
+import fcntl
 import http.server
 import json
 import os
@@ -1205,6 +1206,45 @@ def test_sigterm_inflight_and_pipelined_refresh(bin_path, tmp_dir):
         srv_slow.server_close()
 
 
+
+def test_order_lock_atomic_rmw(bin_path, tmp_dir):
+    sdir = os.path.join(tmp_dir, "order_lock_state")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    env = {"AUTH_ROUTER_STATE_DIR": sdir}
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d1", "sk-d1"], env=env)
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d2", "sk-d2"], env=env)
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d3", "sk-d3"], env=env)
+    run_cmd(bin_path, ["--direct", "order", "d1", "d2", "d3"], env=env)
+
+    lock_path = os.path.join(sdir, "order.lock")
+    order_path = os.path.join(sdir, "order")
+    lfd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        clean_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "AUTH_ROUTER_STATE_DIR": sdir}
+        p = subprocess.Popen(
+            [bin_path, "--direct", "top", "d3"],
+            env=clean_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.15)
+        assert p.poll() is None, "top did not wait for order.lock"
+        with open(order_path, "w") as f:
+            f.write("d2\nd1\nd3\n")
+        fcntl.flock(lfd, fcntl.LOCK_UN)
+        out, err = p.communicate(timeout=5)
+        assert p.returncode == 0, f"top failed: {err}"
+    finally:
+        os.close(lfd)
+
+    with open(order_path) as f:
+        lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    assert lines == ["d3", "d2", "d1"], f"order RMW lost concurrent update: {lines}"
+    print("PASS atomic /order.lock read-modify-write")
+
+
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
@@ -1224,6 +1264,7 @@ def main():
         test_unavail_and_order_validation(bin_path, tmp)
         test_restricted_now_ms_cool_validation_and_slow_reader(bin_path, tmp)
         test_sigterm_inflight_and_pipelined_refresh(bin_path, tmp)
+        test_order_lock_atomic_rmw(bin_path, tmp)
     print("ALL E2E PASSED")
 
 

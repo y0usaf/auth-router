@@ -92,7 +92,9 @@ bool auth_remove_login(const char *name, char *err, size_t err_n);
 bool auth_is_login(const char *name, bool *out, char *err, size_t err_n);
 
 bool auth_names(str_list_t *out, char *err, size_t err_n);
+typedef bool (*auth_order_fn)(const str_list_t *cur, str_list_t *next, void *ctx, char *err, size_t err_n);
 bool auth_write_names(const str_list_t *names, char *err, size_t err_n);
+bool auth_order_update(auth_order_fn fn, void *ctx, char *err, size_t err_n);
 
 bool ak_read(jval_t **out, char *err, size_t err_n);
 bool ak_write(const jval_t *obj, char *err, size_t err_n);
