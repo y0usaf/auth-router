@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_CLIENTS 64
@@ -156,9 +157,10 @@ static bool fill_cred_secret(const cred_t *c, jval_t *out, bool refresh_sync, ch
             if (!found) snprintf(err, err_n, "oauth credential %s not found", c->name);
             return false;
         }
-        if (refresh_sync && !oa_fresh(&tok, now_ms())) {
+        int64_t now = now_ms();
+        if (refresh_sync && !oa_fresh(&tok, now)) {
             oa_tok_t fresh;
-            if (!oa_freshen_at(c->name, &tok, now_ms(), &fresh, err, err_n)) {
+            if (!oa_freshen_at(c->name, &tok, now + 60000, &fresh, err, err_n)) {
                 oa_tok_free(&tok);
                 return false;
             }
@@ -389,6 +391,7 @@ static bool parse_routes_from_req(const jval_t *req, route_cand_t **out_routes, 
 }
 
 static bool eval_route_plan(const jval_t *req,
+                            bool restricted,
                             policy_res_t *pres_out,
                             cred_t *selected_cred_out,
                             bool *has_cred_out,
@@ -423,7 +426,7 @@ static bool eval_route_plan(const jval_t *req,
 
     int64_t now = now_ms();
     int64_t req_now = 0;
-    if (j_int_at(req, "now_ms", &req_now) && req_now > 0) now = req_now;
+    if (!restricted && j_int_at(req, "now_ms", &req_now) && req_now > 0) now = req_now;
 
     route_req_t rr;
     memset(&rr, 0, sizeof(rr));
@@ -599,29 +602,61 @@ static jval_t *exec_non_route_op(const jval_t *req, int64_t started_ms, bool bg_
     }
 
     if (strcmp(op, "order") == 0 || strcmp(op, "top") == 0) {
+        cred_list_t all = {0};
+        if (!auth_credentials(&all, err, sizeof(err))) return make_err(err);
+        str_list_t known = {0};
+        for (size_t i = 0; i < all.len; i++) {
+            str_list_push(&known, all.items[i].name);
+        }
+        cred_list_free(&all);
+
         jval_t *names_arr = j_obj_get(req, "names");
         str_list_t names = {0};
         if (strcmp(op, "top") == 0) {
             const char *n = j_str_at(req, "name");
-            if (!n[0]) return make_err("top requires name");
+            if (!n[0] || strchr(n, '\n') || strchr(n, '\r') || !str_list_has(&known, n)) {
+                str_list_free(&known);
+                return make_err("top requires a known credential name");
+            }
             str_list_push(&names, n);
         } else {
             if (!names_arr || names_arr->type != J_ARR || names_arr->arr_len == 0) {
+                str_list_free(&known);
                 return make_err("order requires names array");
             }
             for (size_t i = 0; i < names_arr->arr_len; i++) {
-                if (names_arr->arr[i]->type == J_STR && names_arr->arr[i]->s[0]) {
-                    str_list_push(&names, names_arr->arr[i]->s);
+                const jval_t *item = names_arr->arr[i];
+                if (!item || item->type != J_STR || !item->s[0] ||
+                    strchr(item->s, '\n') || strchr(item->s, '\r')) {
+                    str_list_free(&names);
+                    str_list_free(&known);
+                    return make_err("order contains invalid credential name");
                 }
+                if (!str_list_has(&known, item->s)) {
+                    snprintf(err, sizeof(err), "unknown credential name: %s", item->s);
+                    str_list_free(&names);
+                    str_list_free(&known);
+                    return make_err(err);
+                }
+                if (str_list_has(&names, item->s)) {
+                    snprintf(err, sizeof(err), "duplicate credential name: %s", item->s);
+                    str_list_free(&names);
+                    str_list_free(&known);
+                    return make_err(err);
+                }
+                str_list_push(&names, item->s);
             }
         }
         str_list_t cur = {0};
         if (auth_names(&cur, err, sizeof(err))) {
             for (size_t i = 0; i < cur.len; i++) {
-                if (!str_list_has(&names, cur.items[i])) str_list_push(&names, cur.items[i]);
+                if (str_list_has(&known, cur.items[i]) && !str_list_has(&names, cur.items[i])) {
+                    str_list_push(&names, cur.items[i]);
+                }
             }
             str_list_free(&cur);
         }
+        str_list_free(&known);
         bool ok = auth_write_names(&names, err, sizeof(err));
         str_list_free(&names);
         if (!ok) return make_err(err);
@@ -676,12 +711,11 @@ static jval_t *exec_non_route_op(const jval_t *req, int64_t started_ms, bool bg_
         const char *id = j_str_at(req, "id");
         const char *model = j_str_at(req, "model");
         if (!id[0] || !model[0]) return make_err("unavail requires id and model");
-        bool missing = false;
-        if (!auth_model_missing(id, model, 404, "model not found", &missing, err, sizeof(err))) {
+        if (!auth_model_update(id, model, true, err, sizeof(err))) {
             return make_err(err);
         }
         jval_t *r = make_ok();
-        j_obj_set(r, "marked", j_bool(missing));
+        j_obj_set(r, "marked", j_bool(true));
         return r;
     }
 
@@ -738,7 +772,7 @@ jval_t *router_exec_direct(const jval_t *req, bool restricted) {
         policy_res_t pres;
         cred_t cred;
         bool has_cred = false;
-        bool plan_ok = eval_route_plan(req, &pres, &cred, &has_cred, err, sizeof(err));
+        bool plan_ok = eval_route_plan(req, restricted, &pres, &cred, &has_cred, err, sizeof(err));
         file_unlock(lfd);
         if (!plan_ok) {
             return make_err(err);
@@ -843,7 +877,7 @@ static int find_job(refresh_job_t *jobs, const char *kind, const char *name) {
     return -1;
 }
 
-static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *name, char *err, size_t err_n) {
+static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *name, int64_t lead_ms, char *err, size_t err_n) {
     int slot = -1;
     for (int i = 0; i < MAX_JOBS; i++) {
         if (!jobs[i].active) {
@@ -907,7 +941,8 @@ static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *
             bool found = false;
             if (oa_load(name, &tok, &found, werr, sizeof(werr)) && found) {
                 oa_tok_t fresh;
-                if (oa_freshen_at(name, &tok, now_ms(), &fresh, werr, sizeof(werr))) {
+                int64_t margin = lead_ms > 60000 ? lead_ms : 60000;
+                if (oa_freshen_at(name, &tok, now_ms() + margin, &fresh, werr, sizeof(werr))) {
                     j_obj_set(out, "ok", j_bool(true));
                     j_obj_set(out, "access", j_str(fresh.access));
                     j_obj_set(out, "expires", j_int(fresh.expires));
@@ -954,7 +989,17 @@ static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *
     return slot;
 }
 
-static void finish_refresh_job(refresh_job_t *job, client_t *clients) {
+static void drain_client_inbuf(client_t *clients,
+                               int cidx,
+                               refresh_job_t *jobs,
+                               int64_t started_ms,
+                               bool bg_refresh);
+
+static void finish_refresh_job(refresh_job_t *job,
+                               refresh_job_t *jobs,
+                               client_t *clients,
+                               int64_t started_ms,
+                               bool bg_refresh) {
     close(job->pipe_fd);
     job->pipe_fd = -1;
     int st = 0;
@@ -967,6 +1012,11 @@ static void finish_refresh_job(refresh_job_t *job, client_t *clients) {
     if (ok) j_int_at(parsed, "expires", &expires);
     const char *rerr = (!ok && parsed) ? j_str_at(parsed, "error") : "refresh worker failed";
 
+    int drain_idx[MAX_WAITERS];
+    uint64_t drain_conn[MAX_WAITERS];
+    size_t drain_cnt = 0;
+    int64_t done_now = now_ms();
+
     for (size_t i = 0; i < job->waiter_cnt; i++) {
         refresh_waiter_t *w = &job->waiters[i];
         if (w->client_idx >= 0 && w->client_idx < MAX_CLIENTS &&
@@ -974,6 +1024,7 @@ static void finish_refresh_job(refresh_job_t *job, client_t *clients) {
             clients[w->client_idx].conn_id == w->conn_id) {
             client_t *c = &clients[w->client_idx];
             c->waiting_refresh = false;
+            c->last_activity_ms = done_now;
             if (ok) {
                 jval_t *res = make_ok();
                 j_obj_set(res, "http_status", j_int(w->pres.http_status));
@@ -997,6 +1048,11 @@ static void finish_refresh_job(refresh_job_t *job, client_t *clients) {
                 client_queue_json(c, er);
                 j_free(er);
             }
+            if (c->fd >= 0 && drain_cnt < MAX_WAITERS) {
+                drain_idx[drain_cnt] = w->client_idx;
+                drain_conn[drain_cnt] = w->conn_id;
+                drain_cnt++;
+            }
         }
         cred_single_free(&w->cred);
     }
@@ -1005,6 +1061,15 @@ static void finish_refresh_job(refresh_job_t *job, client_t *clients) {
     sb_free(&job->result_buf);
     job->active = false;
     job->waiter_cnt = 0;
+
+    for (size_t i = 0; i < drain_cnt; i++) {
+        int cidx = drain_idx[i];
+        if (clients[cidx].fd >= 0 &&
+            clients[cidx].conn_id == drain_conn[i] &&
+            !clients[cidx].waiting_refresh) {
+            drain_client_inbuf(clients, cidx, jobs, started_ms, bg_refresh);
+        }
+    }
 }
 
 static void trigger_bg_refreshes(refresh_job_t *jobs, int64_t lead_ms) {
@@ -1017,7 +1082,7 @@ static void trigger_bg_refreshes(refresh_job_t *jobs, int64_t lead_ms) {
             if (!l->refresh[0]) continue;
             if (l->expires > 0 && l->expires - now <= lead_ms) {
                 if (find_job(jobs, "login", l->name) < 0) {
-                    start_refresh_job(jobs, "login", l->name, err, sizeof(err));
+                    start_refresh_job(jobs, "login", l->name, lead_ms, err, sizeof(err));
                 }
             }
         }
@@ -1035,7 +1100,7 @@ static void trigger_bg_refreshes(refresh_job_t *jobs, int64_t lead_ms) {
             j_int_at(e, "expires", &exp);
             if (exp > 0 && exp - now <= lead_ms) {
                 if (find_job(jobs, "oauth", name) < 0) {
-                    start_refresh_job(jobs, "oauth", name, err, sizeof(err));
+                    start_refresh_job(jobs, "oauth", name, lead_ms, err, sizeof(err));
                 }
             }
         }
@@ -1154,7 +1219,7 @@ static void handle_client_line(client_t *clients,
         bool has_cred = false;
         char err[512];
         err[0] = '\0';
-        if (!eval_route_plan(req, &pres, &cred, &has_cred, err, sizeof(err))) {
+        if (!eval_route_plan(req, c->restricted, &pres, &cred, &has_cred, err, sizeof(err))) {
             jval_t *er = make_err(err);
             client_queue_json(c, er);
             j_free(er);
@@ -1163,10 +1228,10 @@ static void handle_client_line(client_t *clients,
         }
         if (pres.has_selected && has_cred &&
             (strcmp(cred.kind, "login") == 0 || strcmp(cred.kind, "oauth") == 0) &&
-            cred_needs_refresh(&cred, now_ms(), 10000, err, sizeof(err))) {
+            cred_needs_refresh(&cred, now_ms(), 60000, err, sizeof(err))) {
             int jidx = find_job(jobs, cred.kind, cred.name);
             if (jidx < 0) {
-                jidx = start_refresh_job(jobs, cred.kind, cred.name, err, sizeof(err));
+                jidx = start_refresh_job(jobs, cred.kind, cred.name, 60000, err, sizeof(err));
             }
             if (jidx >= 0 && jobs[jidx].waiter_cnt < MAX_WAITERS) {
                 refresh_waiter_t *w = &jobs[jidx].waiters[jobs[jidx].waiter_cnt++];
@@ -1199,6 +1264,32 @@ static void handle_client_line(client_t *clients,
     client_queue_json(c, res);
     j_free(res);
     j_free(req);
+}
+
+static void drain_client_inbuf(client_t *clients,
+                               int cidx,
+                               refresh_job_t *jobs,
+                               int64_t started_ms,
+                               bool bg_refresh) {
+    client_t *c = &clients[cidx];
+    char *nl = NULL;
+    while (c->fd >= 0 && !c->waiting_refresh && c->inbuf.data &&
+           (nl = memchr(c->inbuf.data, '\n', c->inbuf.len)) != NULL) {
+        size_t llen = (size_t)(nl - c->inbuf.data);
+        char *line = malloc(llen + 1);
+        if (!line) {
+            client_close(c);
+            return;
+        }
+        memcpy(line, c->inbuf.data, llen);
+        line[llen] = '\0';
+        size_t rem = c->inbuf.len - (llen + 1);
+        if (rem > 0) memmove(c->inbuf.data, nl + 1, rem);
+        c->inbuf.len = rem;
+        c->inbuf.data[rem] = '\0';
+        handle_client_line(clients, cidx, line, jobs, started_ms, bg_refresh);
+        free(line);
+    }
 }
 
 int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
@@ -1320,7 +1411,6 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                 continue;
             }
             if (idle_timeout_ms > 0 && !clients[i].waiting_refresh &&
-                clients[i].out_off >= clients[i].outbuf.len &&
                 loop_now - clients[i].last_activity_ms > idle_timeout_ms) {
                 client_close(&clients[i]);
                 continue;
@@ -1406,20 +1496,7 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                             continue;
                         }
                         sb_putn(&c->inbuf, buf, (size_t)r);
-                        char *nl = NULL;
-                        while (c->fd >= 0 && !c->waiting_refresh && c->inbuf.data &&
-                               (nl = memchr(c->inbuf.data, '\n', c->inbuf.len)) != NULL) {
-                            size_t llen = (size_t)(nl - c->inbuf.data);
-                            char *line = malloc(llen + 1);
-                            memcpy(line, c->inbuf.data, llen);
-                            line[llen] = '\0';
-                            size_t rem = c->inbuf.len - (llen + 1);
-                            if (rem > 0) memmove(c->inbuf.data, nl + 1, rem);
-                            c->inbuf.len = rem;
-                            c->inbuf.data[rem] = '\0';
-                            handle_client_line(clients, idx, line, jobs, started_ms, !cfg->no_bg_refresh);
-                            free(line);
-                        }
+                        drain_client_inbuf(clients, idx, jobs, started_ms, !cfg->no_bg_refresh);
                     } else if (r == 0) {
                         c->eof_read = true;
                         if (!c->waiting_refresh && c->out_off >= c->outbuf.len) {
@@ -1474,7 +1551,7 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                     break;
                 }
                 if (done || (pfds[k].revents & (POLLHUP | POLLERR))) {
-                    finish_refresh_job(j, clients);
+                    finish_refresh_job(j, jobs, clients, started_ms, !cfg->no_bg_refresh);
                 }
             }
         }
@@ -1493,9 +1570,41 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
     }
     for (int i = 0; i < MAX_JOBS; i++) {
         if (jobs[i].active) {
-            if (jobs[i].pipe_fd >= 0) close(jobs[i].pipe_fd);
-            int st = 0;
-            waitpid(jobs[i].pid, &st, 0);
+            if (jobs[i].pipe_fd >= 0) {
+                close(jobs[i].pipe_fd);
+                jobs[i].pipe_fd = -1;
+            }
+            if (jobs[i].pid > 0) kill(jobs[i].pid, SIGTERM);
+        }
+    }
+    int64_t reap_deadline = now_ms() + 1000;
+    for (;;) {
+        bool any_alive = false;
+        for (int i = 0; i < MAX_JOBS; i++) {
+            if (jobs[i].active && jobs[i].pid > 0) {
+                int st = 0;
+                pid_t wp = waitpid(jobs[i].pid, &st, WNOHANG);
+                if (wp == jobs[i].pid || (wp < 0 && errno == ECHILD)) {
+                    jobs[i].pid = -1;
+                } else {
+                    any_alive = true;
+                }
+            }
+        }
+        if (!any_alive || now_ms() >= reap_deadline) break;
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 20000000;
+        nanosleep(&ts, NULL);
+    }
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs[i].active) {
+            if (jobs[i].pid > 0) {
+                kill(jobs[i].pid, SIGKILL);
+                int st = 0;
+                waitpid(jobs[i].pid, &st, 0);
+                jobs[i].pid = -1;
+            }
             for (size_t w = 0; w < jobs[i].waiter_cnt; w++) {
                 cred_single_free(&jobs[i].waiters[w].cred);
             }

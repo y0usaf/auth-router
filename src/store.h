@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define ACP_PROVIDER "antigravity-acp"
+#define AUTH_MAX_COOLDOWN_MS (24LL * 3600LL * 1000LL)
 
 typedef struct {
     char *name;
@@ -105,6 +106,7 @@ bool auth_holds(hold_list_t *out, char *err, size_t err_n);
 bool auth_limit(const char *id, const char *model, int status, const kv_t *headers, size_t hcnt, int64_t cooldown_ms, bool *limited_out, char *err, size_t err_n);
 bool auth_models(unavail_list_t *out, char *err, size_t err_n);
 bool auth_unavailable(const char *id, const char *model, const unavail_list_t *rows);
+bool auth_model_update(const char *id, const char *model, bool missing, char *err, size_t err_n);
 bool auth_model_missing(const char *id, const char *model, int status, const char *body, bool *missing_out, char *err, size_t err_n);
 bool auth_forget(const char *id, char *err, size_t err_n);
 

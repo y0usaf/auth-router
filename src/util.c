@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,8 @@ void sb_init(sb_t *sb) {
     sb->cap = 64;
     sb->len = 0;
     sb->data = malloc(sb->cap);
-    if (sb->data) sb->data[0] = '\0';
+    if (!sb->data) abort();
+    sb->data[0] = '\0';
 }
 
 void sb_free(sb_t *sb) {
@@ -29,9 +31,17 @@ void sb_free(sb_t *sb) {
 }
 
 static void sb_grow(sb_t *sb, size_t need) {
-    if (sb->len + need + 1 <= sb->cap) return;
-    size_t ncap = sb->cap ? sb->cap * 2 : 64;
-    while (ncap < sb->len + need + 1) ncap *= 2;
+    if (need > SIZE_MAX - sb->len - 1) abort();
+    size_t req = sb->len + need + 1;
+    if (req <= sb->cap) return;
+    size_t ncap = sb->cap ? sb->cap : 64;
+    while (ncap < req) {
+        if (ncap > SIZE_MAX / 2) {
+            ncap = req;
+            break;
+        }
+        ncap *= 2;
+    }
     char *p = realloc(sb->data, ncap);
     if (!p) abort();
     sb->data = p;
@@ -344,7 +354,7 @@ bool parse_duration_ms(const char *s, int64_t *out) {
         if (!*p) break;
         char *end = NULL;
         double val = strtod(p, &end);
-        if (end == p || val < 0.0) return false;
+        if (end == p || !isfinite(val) || val < 0.0) return false;
         p = end;
         while (*p == ' ' || *p == '\t') p++;
         char unit[16];
@@ -366,10 +376,12 @@ bool parse_duration_ms(const char *s, int64_t *out) {
         else if (strcmp(unit, "h") == 0 || strcmp(unit, "hr") == 0 || strcmp(unit, "hrs") == 0 || strcmp(unit, "hour") == 0 || strcmp(unit, "hours") == 0) mult = 3600000.0;
         else if (strcmp(unit, "d") == 0 || strcmp(unit, "day") == 0 || strcmp(unit, "days") == 0) mult = 86400000.0;
         else return false;
-        total += val * mult;
+        double term = val * mult;
+        if (!isfinite(term) || term < 0.0 || term > 4.0e18 || total > 4.0e18 - term) return false;
+        total += term;
         any = true;
     }
-    if (!any) return false;
+    if (!any || !isfinite(total) || total < 0.0 || total > 4.0e18) return false;
     *out = (int64_t)(total + 0.5);
     return true;
 }

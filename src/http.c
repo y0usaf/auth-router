@@ -518,6 +518,10 @@ static bool parse_http_response(const char *raw,
                 snprintf(err, err_n, "invalid Content-Length header");
                 return false;
             }
+            if (content_length >= 0 && content_length != cl) {
+                snprintf(err, err_n, "conflicting Content-Length headers");
+                return false;
+            }
             content_length = cl;
         }
         if (!nl) break;
@@ -594,8 +598,17 @@ bool http_request(const char *method,
     } else {
         sb_printf(&req, "Host: %s:%d\r\n", u.host, u.port_num);
     }
+    bool has_ua = false;
+    for (size_t i = 0; i < header_cnt; i++) {
+        if (headers[i] && header_prefix_ci(headers[i], "user-agent")) {
+            has_ua = true;
+            break;
+        }
+    }
     sb_puts(&req, "Connection: close\r\n");
-    sb_puts(&req, "User-Agent: auth-router/0.1\r\n");
+    if (!has_ua) {
+        sb_puts(&req, "User-Agent: auth-router/0.1\r\n");
+    }
 
     for (size_t i = 0; i < header_cnt; i++) {
         if (!headers[i] || !*headers[i]) continue;
@@ -848,11 +861,13 @@ bool callback_wait(int sock,
         }
         if (pr == 0) continue;
 
-        if (allow_stdin && nfds > 1 && (pfds[1].revents & POLLIN)) {
-            if (fgets(query_out, (int)query_n, stdin)) {
-                str_trim(query_out);
-                if (from_stdin) *from_stdin = true;
-                return true;
+        if (allow_stdin && nfds > 1 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (pfds[1].revents & POLLIN) {
+                if (fgets(query_out, (int)query_n, stdin)) {
+                    str_trim(query_out);
+                    if (from_stdin) *from_stdin = true;
+                    return true;
+                }
             }
             allow_stdin = false;
         }

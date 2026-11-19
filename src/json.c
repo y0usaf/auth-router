@@ -2,6 +2,7 @@
 
 #include "json.h"
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -282,7 +283,11 @@ static jval_t *parse_val(jparse_t *jp, int depth) {
         if (n >= sizeof(buf)) return NULL;
         memcpy(buf, start, n);
         buf[n] = '\0';
-        if (is_flt) return j_num(strtod(buf, NULL));
+        if (is_flt) {
+            double d = strtod(buf, NULL);
+            if (!isfinite(d)) return NULL;
+            return j_num(d);
+        }
         int64_t iv = 0;
         if (!str_to_i64(buf, &iv)) return j_num(strtod(buf, NULL));
         return j_int(iv);

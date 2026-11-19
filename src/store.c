@@ -327,6 +327,23 @@ bool auth_names(str_list_t *out, char *err, size_t err_n) {
 }
 
 bool auth_write_names(const str_list_t *names, char *err, size_t err_n) {
+    for (size_t i = 0; i < names->len; i++) {
+        const char *n = names->items[i];
+        if (!n || !n[0] || strchr(n, '\n') || strchr(n, '\r')) {
+            snprintf(err, err_n, "invalid credential name in order");
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(names->items[j], n) == 0) {
+                snprintf(err, err_n, "duplicate credential name in order: %s", n);
+                return false;
+            }
+        }
+    }
+    char lock_path[1024];
+    state_path("/order.lock", lock_path, sizeof(lock_path));
+    int fd = -1;
+    if (!file_lock(lock_path, &fd, err, err_n)) return false;
     sb_t sb;
     sb_init(&sb);
     for (size_t i = 0; i < names->len; i++) {
@@ -336,6 +353,7 @@ bool auth_write_names(const str_list_t *names, char *err, size_t err_n) {
     sb_putc(&sb, '\n');
     bool ok = state_write_text("/order", sb.data, sb.len, err, err_n);
     sb_free(&sb);
+    file_unlock(fd);
     return ok;
 }
 
@@ -586,8 +604,16 @@ static bool write_holds(const hold_list_t *holds, char *err, size_t err_n) {
 
 bool auth_limit(const char *id, const char *model, int status, const kv_t *headers, size_t hcnt, int64_t cooldown_ms, bool *limited_out, char *err, size_t err_n) {
     *limited_out = false;
-    if (strchr(model, '\t') || strchr(model, '\n')) {
+    if (!id || !id[0] || strchr(id, '\t') || strchr(id, '\r') || strchr(id, '\n')) {
+        snprintf(err, err_n, "invalid credential id");
+        return false;
+    }
+    if (model && (strchr(model, '\t') || strchr(model, '\r') || strchr(model, '\n'))) {
         snprintf(err, err_n, "a model id has no tab or newline");
+        return false;
+    }
+    if (cooldown_ms < 0 || cooldown_ms > AUTH_MAX_COOLDOWN_MS) {
+        snprintf(err, err_n, "cooldown_ms out of range");
         return false;
     }
     if (status != 429 && status != 402) return true;
@@ -661,7 +687,15 @@ bool auth_unavailable(const char *id, const char *model, const unavail_list_t *r
     return false;
 }
 
-static bool auth_model_update(const char *id, const char *model, bool missing, char *err, size_t err_n) {
+bool auth_model_update(const char *id, const char *model, bool missing, char *err, size_t err_n) {
+    if (!id || !id[0] || strchr(id, '\t') || strchr(id, '\r') || strchr(id, '\n')) {
+        snprintf(err, err_n, "invalid credential id");
+        return false;
+    }
+    if (missing && (!model || !model[0] || strchr(model, '\t') || strchr(model, '\r') || strchr(model, '\n'))) {
+        snprintf(err, err_n, "invalid model id");
+        return false;
+    }
     char lock_path[1024];
     state_path("/logins.lock", lock_path, sizeof(lock_path));
     int fd = -1;
@@ -857,22 +891,12 @@ bool auth_rank(const str_list_t *names, const login_list_t *logins, login_list_t
     bool *used = calloc(fin.len ? fin.len : 1, sizeof(bool));
     for (size_t i = 0; i < names->len; i++) {
         if (j_obj_get(ak, names->items[i])) continue;
-        bool found = false;
         for (size_t j = 0; j < fin.len; j++) {
             if (!used[j] && strcmp(fin.items[j].name, names->items[i]) == 0) {
                 used[j] = true;
                 login_list_push(out, &fin.items[j]);
-                found = true;
                 break;
             }
-        }
-        if (!found) {
-            free(used);
-            login_list_free(&fin);
-            login_list_free(out);
-            j_free(ak);
-            snprintf(err, err_n, "no finished login named %s, or it is listed twice", names->items[i]);
-            return false;
         }
     }
     for (size_t j = 0; j < fin.len; j++) {
@@ -885,23 +909,17 @@ bool auth_rank(const str_list_t *names, const login_list_t *logins, login_list_t
 }
 
 bool auth_credential_pick(const str_list_t *names, const cred_list_t *pool, cred_list_t *out, char *err, size_t err_n) {
+    (void)err;
+    (void)err_n;
     memset(out, 0, sizeof(*out));
     bool *used = calloc(pool->len ? pool->len : 1, sizeof(bool));
     for (size_t i = 0; i < names->len; i++) {
-        bool found = false;
         for (size_t j = 0; j < pool->len; j++) {
             if (!used[j] && strcmp(pool->items[j].name, names->items[i]) == 0) {
                 used[j] = true;
                 cred_list_push(out, pool->items[j].name, pool->items[j].provider, pool->items[j].id, pool->items[j].kind);
-                found = true;
                 break;
             }
-        }
-        if (!found) {
-            free(used);
-            cred_list_free(out);
-            snprintf(err, err_n, "no credential named %s, or it is listed twice", names->items[i]);
-            return false;
         }
     }
     for (size_t j = 0; j < pool->len; j++) {

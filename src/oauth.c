@@ -475,7 +475,7 @@ bool oa_save_named(const char *provider, const char *name, const oa_tok_t *t, ch
 }
 
 bool oa_fresh(const oa_tok_t *t, int64_t now) {
-    return t->expires == 0 || (t->expires - 60000) > now;
+    return t->access && t->access[0] && (t->expires == 0 || (t->expires - 60000) > now);
 }
 
 static const char *device_url_for(const char *provider) {
@@ -514,7 +514,7 @@ static const char *client_id_for(const char *provider) {
 
 bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_tok_t *out, char *err, size_t err_n) {
     memset(out, 0, sizeof(*out));
-    if (stored->expires == 0 || stored->expires > at_ms) {
+    if (stored->access && stored->access[0] && (stored->expires == 0 || stored->expires > at_ms)) {
         out->access = xstrdup(stored->access);
         out->refresh = xstrdup(stored->refresh);
         out->expires = stored->expires;

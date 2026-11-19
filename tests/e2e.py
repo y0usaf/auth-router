@@ -88,7 +88,7 @@ def gen_self_signed_cert(tmp_dir, name, cn="localhost", san="DNS:localhost,IP:12
 
 
 def start_https_token_server(crt, key, delay_s=0.0, chunked=False):
-    state = {"count": 0, "lock": threading.Lock()}
+    state = {"count": 0, "lock": threading.Lock(), "ua_headers": []}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -99,7 +99,9 @@ def start_https_token_server(crt, key, delay_s=0.0, chunked=False):
             _ = self.rfile.read(length) if length > 0 else b""
             if delay_s > 0:
                 time.sleep(delay_s)
+            uas = self.headers.get_all("User-Agent") or []
             with state["lock"]:
+                state["ua_headers"].append(list(uas))
                 state["count"] += 1
                 n = state["count"]
             payload = json.dumps(
@@ -795,6 +797,414 @@ def test_sizes(bin_path, closure_size_file):
     print("PASS binary + closure size report")
 
 
+
+def test_oauth_proactive_and_preexpiry_and_ua(bin_path, tmp_dir):
+    crt, key = gen_self_signed_cert(tmp_dir, "oa_cert")
+    srv, port, st = start_https_token_server(crt, key, delay_s=0.0, chunked=False)
+    try:
+        sdir = os.path.join(tmp_dir, "oa_direct_state")
+        os.makedirs(sdir, mode=0o700, exist_ok=True)
+        near_exp = int(time.time() * 1000) + 30000
+        with open(os.path.join(sdir, "auth.json"), "w") as f:
+            json.dump(
+                {
+                    "xai1": {
+                        "type": "oauth",
+                        "provider": "xai",
+                        "access": "old-oa-direct",
+                        "refresh": "ref-oa-direct",
+                        "expires": near_exp,
+                    }
+                },
+                f,
+            )
+        env_d = {
+            "AUTH_ROUTER_STATE_DIR": sdir,
+            "XAI_OAUTH_TOKEN_URL": f"https://localhost:{port}/token",
+            "AUTH_ROUTER_CA_FILE": crt,
+        }
+        r_dir = json.loads(
+            run_cmd(bin_path, ["--direct", "token", "xai", "grok-3", "--json"], env=env_d).stdout
+        )
+        assert r_dir["ok"] is True and r_dir["access"] == "fresh-tok-1", r_dir
+        assert st["count"] == 1
+        assert st["ua_headers"][-1] == ["auth-router/0.1"], st["ua_headers"]
+
+        with open(os.path.join(sdir, "logins"), "w") as f:
+            f.write(f"ua_login\told-tok\tref-ua\t{near_exp}\t0\t\n")
+        env_ua = dict(env_d)
+        env_ua["CREST_AUTH_TOKEN_URL"] = f"https://localhost:{port}/token"
+        r_ua = json.loads(
+            run_cmd(bin_path, ["--direct", "token", "anthropic", "claude-opus-5-5", "--json"], env=env_ua).stdout
+        )
+        assert r_ua["ok"] is True and r_ua["access"] == "fresh-tok-2", r_ua
+        assert len(st["ua_headers"][-1]) == 1 and st["ua_headers"][-1][0].startswith("claude-cli/"), st["ua_headers"]
+
+        sdir2 = os.path.join(tmp_dir, "oa_daemon_state")
+        os.makedirs(sdir2, mode=0o700, exist_ok=True)
+        sock = os.path.join(tmp_dir, "oa_daemon.sock")
+        near_exp2 = int(time.time() * 1000) + 30000
+        with open(os.path.join(sdir2, "auth.json"), "w") as f:
+            json.dump(
+                {
+                    "xai2": {
+                        "type": "oauth",
+                        "provider": "xai",
+                        "access": "old-oa-daemon",
+                        "refresh": "ref-oa-daemon",
+                        "expires": near_exp2,
+                    }
+                },
+                f,
+            )
+        denv = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "AUTH_ROUTER_STATE_DIR": sdir2,
+            "XAI_OAUTH_TOKEN_URL": f"https://localhost:{port}/token",
+            "AUTH_ROUTER_CA_FILE": crt,
+        }
+        proc = subprocess.Popen(
+            [bin_path, "daemon", "--socket", sock, "--state-dir", sdir2, "--no-bg-refresh"],
+            env=denv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(50):
+                if os.path.exists(sock):
+                    break
+                time.sleep(0.05)
+            r_dm = unix_rpc_raw(sock, json.dumps({"v": 1, "op": "token", "provider": "xai", "model": "grok-3"}))
+            assert r_dm["ok"] is True and r_dm["access"] == "fresh-tok-3", r_dm
+            assert st["count"] == 3
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=5)
+
+        sdir3 = os.path.join(tmp_dir, "oa_bg_state")
+        os.makedirs(sdir3, mode=0o700, exist_ok=True)
+        sock3 = os.path.join(tmp_dir, "oa_bg.sock")
+        near_exp3 = int(time.time() * 1000) + 90000
+        with open(os.path.join(sdir3, "auth.json"), "w") as f:
+            json.dump(
+                {
+                    "xai3": {
+                        "type": "oauth",
+                        "provider": "xai",
+                        "access": "old-oa-bg",
+                        "refresh": "ref-oa-bg",
+                        "expires": near_exp3,
+                    }
+                },
+                f,
+            )
+        denv3 = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "AUTH_ROUTER_STATE_DIR": sdir3,
+            "XAI_OAUTH_TOKEN_URL": f"https://localhost:{port}/token",
+            "AUTH_ROUTER_CA_FILE": crt,
+            "AUTH_ROUTER_BG_CHECK_MS": "100",
+            "AUTH_ROUTER_BG_LEAD_MS": "120000",
+        }
+        proc3 = subprocess.Popen(
+            [bin_path, "daemon", "--socket", sock3, "--state-dir", sdir3],
+            env=denv3,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(50):
+                if os.path.exists(sock3):
+                    break
+                time.sleep(0.05)
+            refreshed = False
+            for _ in range(40):
+                with open(os.path.join(sdir3, "auth.json")) as f:
+                    data = json.load(f)
+                if data["xai3"]["access"] == "fresh-tok-4":
+                    refreshed = True
+                    break
+                time.sleep(0.1)
+            assert refreshed, "oauth proactive bg refresh did not update auth.json"
+            time.sleep(0.4)
+            assert st["count"] == 4, f"oauth bg refresh fork-looped: count={st['count']}"
+        finally:
+            proc3.send_signal(signal.SIGTERM)
+            proc3.wait(timeout=5)
+        print("PASS oauth pre-expiry + proactive bg refresh + single User-Agent header")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_unavail_and_order_validation(bin_path, tmp_dir):
+    sdir = os.path.join(tmp_dir, "unavail_order_state")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    sock = os.path.join(tmp_dir, "unavail_order.sock")
+    env = {"AUTH_ROUTER_STATE_DIR": sdir}
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d1", "sk-d1"], env=env)
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d2", "sk-d2"], env=env)
+    run_cmd(bin_path, ["--direct", "add", "openai", "o1", "sk-o1"], env=env)
+
+    denv = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "AUTH_ROUTER_STATE_DIR": sdir}
+    proc = subprocess.Popen(
+        [bin_path, "daemon", "--socket", sock, "--state-dir", sdir, "--no-bg-refresh"],
+        env=denv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(50):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+
+        r_ord = unix_rpc_raw(sock, json.dumps({"v": 1, "op": "order", "names": ["d1", "d2", "o1"]}))
+        assert r_ord["ok"] is True, r_ord
+
+        r_u = unix_rpc_raw(sock, json.dumps({"v": 1, "op": "unavail", "id": "deepseek:d1", "model": "deepseek-chat"}))
+        assert r_u["ok"] is True and r_u["marked"] is True, r_u
+
+        r_rt = unix_rpc_raw(
+            sock,
+            json.dumps({
+                "v": 1,
+                "op": "route",
+                "routes": [
+                    {"provider": "deepseek", "model": "deepseek-chat"},
+                    {"provider": "openai", "model": "gpt-5"},
+                ],
+            }),
+        )
+        assert r_rt["ok"] is True and r_rt["http_status"] == 200 and r_rt["login_id"] == "d2", r_rt
+
+        r_u2 = unix_rpc_raw(sock, json.dumps({"v": 1, "op": "unavail", "id": "deepseek:d2", "model": "deepseek-chat"}))
+        assert r_u2["ok"] is True and r_u2["marked"] is True, r_u2
+
+        r_rt2 = unix_rpc_raw(
+            sock,
+            json.dumps({
+                "v": 1,
+                "op": "route",
+                "routes": [
+                    {"provider": "deepseek", "model": "deepseek-chat"},
+                    {"provider": "openai", "model": "gpt-5"},
+                ],
+            }),
+        )
+        assert r_rt2["ok"] is True and r_rt2["provider"] == "openai" and r_rt2["login_id"] == "o1", r_rt2
+
+        for bad_req in [
+            {"v": 1, "op": "order", "names": ["nonexistent"]},
+            {"v": 1, "op": "order", "names": ["d1", "d1"]},
+            {"v": 1, "op": "order", "names": ["d1\nd2"]},
+            {"v": 1, "op": "order", "names": [""]},
+            {"v": 1, "op": "top", "name": "nonexistent"},
+            {"v": 1, "op": "top", "name": "d1\n"},
+        ]:
+            rb = unix_rpc_raw(sock, json.dumps(bad_req))
+            assert rb["ok"] is False, f"expected rejection for {bad_req}, got {rb}"
+
+        with open(os.path.join(sdir, "order"), "w") as f:
+            f.write("stale_deleted_cred\nd2\nd1\n")
+        r_rt3 = unix_rpc_raw(
+            sock,
+            json.dumps({"v": 1, "op": "token", "provider": "openai", "model": "gpt-5"}),
+        )
+        assert r_rt3["ok"] is True and r_rt3["login_id"] == "o1", r_rt3
+        print("PASS unavail daemon op + order/top validation + stale order tolerance")
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+
+def test_restricted_now_ms_cool_validation_and_slow_reader(bin_path, tmp_dir):
+    sdir = os.path.join(tmp_dir, "sec_state")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    sock = os.path.join(tmp_dir, "sec.sock")
+    rsock = os.path.join(tmp_dir, "sec-r.sock")
+    env = {"AUTH_ROUTER_STATE_DIR": sdir}
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d1", "sk-d1"], env=env)
+    run_cmd(bin_path, ["--direct", "add", "deepseek", "d2", "sk-d2"], env=env)
+    run_cmd(bin_path, ["--direct", "order", "d1", "d2"], env=env)
+    run_cmd(bin_path, ["--direct", "cool", "deepseek:d1", "deepseek-chat", "30m"], env=env)
+
+    denv = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AUTH_ROUTER_STATE_DIR": sdir,
+        "AUTH_ROUTER_CLIENT_IDLE_MS": "400",
+    }
+    proc = subprocess.Popen(
+        [
+            bin_path,
+            "daemon",
+            "--socket",
+            sock,
+            "--restricted-socket",
+            rsock,
+            "--state-dir",
+            sdir,
+            "--no-bg-refresh",
+        ],
+        env=denv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(50):
+            if os.path.exists(sock) and os.path.exists(rsock):
+                break
+            time.sleep(0.05)
+
+        future_ms = int(time.time() * 1000) + 2000000
+        req_route = {
+            "v": 1,
+            "op": "route",
+            "routes": [{"provider": "deepseek", "model": "deepseek-chat"}],
+            "now_ms": future_ms,
+        }
+        rp = unix_rpc_raw(sock, json.dumps(req_route))
+        assert rp["ok"] is True and rp["login_id"] == "d1", rp
+
+        rr = unix_rpc_raw(rsock, json.dumps(req_route))
+        assert rr["ok"] is True and rr["login_id"] == "d2", rr
+
+        for bad_cool in [
+            {"v": 1, "op": "cool", "id": "deepseek:d1\tmodel", "model": "m", "duration": "60s"},
+            {"v": 1, "op": "cool", "id": "deepseek:d1\nfoo", "model": "m", "duration": "60s"},
+            {"v": 1, "op": "cool", "id": "deepseek:d1", "model": "m", "duration": "NaN s"},
+            {"v": 1, "op": "cool", "id": "deepseek:d1", "model": "m", "duration": "inf s"},
+            {"v": 1, "op": "cool", "id": "deepseek:d1", "model": "m", "duration": "1e300 s"},
+            {"v": 1, "op": "cool", "id": "deepseek:d1", "model": "m", "duration": "30d"},
+            {"v": 1, "op": "cool", "id": "deepseek:d1", "model": "m", "cooldown_ms": 100000000000},
+            {"v": 1, "op": "cool", "id": "deepseek:d1", "model": "m", "cooldown_ms": -100},
+        ]:
+            rc = unix_rpc_raw(rsock, json.dumps(bad_cool))
+            assert rc["ok"] is False, f"expected cool rejection for {bad_cool}, got {rc}"
+
+        slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        slow.settimeout(2)
+        slow.connect(sock)
+        slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        payload = (json.dumps({"v": 1, "op": "list"}) + "\n").encode() * 64
+        slow.sendall(payload)
+        time.sleep(0.9)
+        evicted = False
+        try:
+            while True:
+                data = slow.recv(4096)
+                if not data:
+                    evicted = True
+                    break
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            evicted = True
+        slow.close()
+        assert evicted, "slow-reader client was not evicted after idle timeout"
+
+        r_ping = unix_rpc_raw(sock, json.dumps({"v": 1, "op": "ping"}))
+        assert r_ping["ok"] is True
+        print("PASS restricted now_ms ignored + cool validation + slow-reader eviction")
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+
+def test_sigterm_inflight_and_pipelined_refresh(bin_path, tmp_dir):
+    crt, key = gen_self_signed_cert(tmp_dir, "pipe_cert")
+    srv_fast, port_fast, _ = start_https_token_server(crt, key, delay_s=0.25, chunked=False)
+    sdir = os.path.join(tmp_dir, "pipe_state")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    sock = os.path.join(tmp_dir, "pipe.sock")
+    past = int(time.time() * 1000) - 60000
+    with open(os.path.join(sdir, "logins"), "w") as f:
+        f.write(f"p1\told-p1\tref-p1\t{past}\t0\t\n")
+    denv = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AUTH_ROUTER_STATE_DIR": sdir,
+        "CREST_AUTH_TOKEN_URL": f"https://localhost:{port_fast}/token",
+        "AUTH_ROUTER_CA_FILE": crt,
+    }
+    proc = subprocess.Popen(
+        [bin_path, "daemon", "--socket", sock, "--state-dir", sdir, "--no-bg-refresh"],
+        env=denv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(50):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        sc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sc.settimeout(5)
+        sc.connect(sock)
+        req1 = json.dumps({"v": 1, "op": "token", "provider": "anthropic", "model": "claude-opus-5-5"})
+        req2 = json.dumps({"v": 1, "op": "ping"})
+        sc.sendall((req1 + "\n" + req2 + "\n").encode())
+        sc.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = sc.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        sc.close()
+        lines = [json.loads(ln) for ln in buf.decode().splitlines() if ln.strip()]
+        assert len(lines) == 2, f"expected 2 pipelined responses, got {lines}"
+        assert lines[0]["ok"] is True and lines[0]["access"] == "fresh-tok-1", lines[0]
+        assert lines[1]["ok"] is True and "pid" in lines[1], lines[1]
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+        srv_fast.shutdown()
+        srv_fast.server_close()
+
+    srv_slow, port_slow, _ = start_https_token_server(crt, key, delay_s=8.0, chunked=False)
+    sdir2 = os.path.join(tmp_dir, "term_state")
+    os.makedirs(sdir2, mode=0o700, exist_ok=True)
+    sock2 = os.path.join(tmp_dir, "term.sock")
+    with open(os.path.join(sdir2, "logins"), "w") as f:
+        f.write(f"s1\told-s1\tref-s1\t{past}\t0\t\n")
+    denv2 = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AUTH_ROUTER_STATE_DIR": sdir2,
+        "CREST_AUTH_TOKEN_URL": f"https://localhost:{port_slow}/token",
+        "AUTH_ROUTER_CA_FILE": crt,
+    }
+    proc2 = subprocess.Popen(
+        [bin_path, "daemon", "--socket", sock2, "--state-dir", sdir2, "--no-bg-refresh"],
+        env=denv2,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(50):
+            if os.path.exists(sock2):
+                break
+            time.sleep(0.05)
+        st_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        st_sock.settimeout(5)
+        st_sock.connect(sock2)
+        st_sock.sendall(
+            (json.dumps({"v": 1, "op": "token", "provider": "anthropic", "model": "claude-opus-5-5"}) + "\n").encode()
+        )
+        time.sleep(0.25)
+        t0 = time.monotonic()
+        proc2.send_signal(signal.SIGTERM)
+        rc = proc2.wait(timeout=3)
+        elapsed = time.monotonic() - t0
+        st_sock.close()
+        assert rc == 0, f"expected clean SIGTERM exit 0, got {rc}"
+        assert elapsed < 2.0, f"SIGTERM hung with in-flight worker: {elapsed:.2f}s"
+        print(f"PASS pipelined refresh + prompt SIGTERM with in-flight worker ({elapsed:.2f}s)")
+    finally:
+        if proc2.poll() is None:
+            proc2.kill()
+            proc2.wait()
+        srv_slow.shutdown()
+        srv_slow.server_close()
+
+
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
@@ -810,6 +1220,10 @@ def main():
         test_daemon_rss_ceiling(bin_path, tmp)
         test_cross_provider_routing_and_chunking(bin_path, tmp)
         test_crest_auth_compat(bin_path, tmp)
+        test_oauth_proactive_and_preexpiry_and_ua(bin_path, tmp)
+        test_unavail_and_order_validation(bin_path, tmp)
+        test_restricted_now_ms_cool_validation_and_slow_reader(bin_path, tmp)
+        test_sigterm_inflight_and_pipelined_refresh(bin_path, tmp)
     print("ALL E2E PASSED")
 
 
