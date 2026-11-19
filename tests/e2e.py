@@ -1320,8 +1320,11 @@ def test_crest_auth_dropin_compat(bin_path, tmp_dir):
             "access": "oa-codex-tok",
             "refresh": "oa-codex-ref",
             "expires": future,
-            "project": "p-123",
-            "account_id": "acc-456",
+            "extra": {
+                "project": "p-123",
+                "account_id": "acc-456",
+                "plan": "pro",
+            },
         },
         "ds1": {
             "provider": "deepseek",
@@ -1350,7 +1353,7 @@ def test_crest_auth_dropin_compat(bin_path, tmp_dir):
     r_oa = json.loads(run_cmd(crest_path, ["--direct", "json", "token", "openai-codex"], env=env).stdout)
     assert r_oa["login"] == "codex1" and r_oa["login_id"] == "codex1", r_oa
     assert r_oa["access"] == "oa-codex-tok", r_oa
-    assert r_oa["project"] == "p-123" and r_oa["account_id"] == "acc-456", r_oa
+    assert r_oa["project"] == "p-123" and r_oa["account_id"] == "acc-456" and r_oa["plan"] == "pro", r_oa
     assert "error" not in r_oa, r_oa
 
     r_key = json.loads(run_cmd(crest_path, ["--direct", "json", "token", "deepseek"], env=env).stdout)

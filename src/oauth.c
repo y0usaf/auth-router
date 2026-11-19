@@ -467,13 +467,21 @@ bool oa_load(const char *name, oa_tok_t *out, bool *found, char *err, size_t err
     out->refresh = xstrdup(j_str_at(entry, "refresh"));
     j_int_at(entry, "expires", &out->expires);
     out->extra = j_obj();
+    jval_t *nested = j_obj_get(entry, "extra");
+    if (nested && nested->type == J_OBJ) {
+        for (size_t i = 0; i < nested->obj_len; i++) {
+            const char *k = nested->obj[i].key;
+            if (k && k[0]) j_obj_set(out->extra, k, j_clone(nested->obj[i].val));
+        }
+    }
     for (size_t i = 0; i < entry->obj_len; i++) {
         const char *k = entry->obj[i].key;
         if (strcmp(k, "type") == 0 || strcmp(k, "provider") == 0 ||
-            strcmp(k, "access") == 0 || strcmp(k, "refresh") == 0 || strcmp(k, "expires") == 0) {
+            strcmp(k, "access") == 0 || strcmp(k, "refresh") == 0 ||
+            strcmp(k, "expires") == 0 || strcmp(k, "extra") == 0) {
             continue;
         }
-        if (entry->obj[i].val->type == J_STR) {
+        if (entry->obj[i].val->type == J_STR && !j_obj_get(out->extra, k)) {
             j_obj_set(out->extra, k, j_str(entry->obj[i].val->s));
         }
     }
@@ -489,10 +497,8 @@ bool oa_save_named(const char *provider, const char *name, const oa_tok_t *t, ch
     j_obj_set(e, "access", j_str(t->access));
     j_obj_set(e, "refresh", j_str(t->refresh));
     j_obj_set(e, "expires", j_int(t->expires));
-    if (t->extra && t->extra->type == J_OBJ) {
-        for (size_t i = 0; i < t->extra->obj_len; i++) {
-            j_obj_set(e, t->extra->obj[i].key, j_clone(t->extra->obj[i].val));
-        }
+    if (t->extra && t->extra->type == J_OBJ && t->extra->obj_len > 0) {
+        j_obj_set(e, "extra", j_clone(t->extra));
     }
     return ak_put(name, e, err, err_n);
 }
