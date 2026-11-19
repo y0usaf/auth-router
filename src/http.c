@@ -714,7 +714,12 @@ bool http_request(const char *method,
                                     sb_putn(&raw, (const char *)buf, (size_t)r);
                                     continue;
                                 }
-                                if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                                if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                                    ok = true;
+                                    break;
+                                }
+                                if (r == 0) {
+                                    require_explicit_framing = true;
                                     ok = true;
                                     break;
                                 }

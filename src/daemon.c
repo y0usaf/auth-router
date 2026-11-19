@@ -1392,6 +1392,10 @@ int daemon_run(const daemon_cfg_t *cfg, char *err, size_t err_n) {
                     client_close(c);
                     continue;
                 }
+                if ((pfds[k].revents & POLLHUP) && !(pfds[k].revents & POLLIN)) {
+                    client_close(c);
+                    continue;
+                }
                 if (pfds[k].revents & POLLIN) {
                     char buf[4096];
                     ssize_t r = read(c->fd, buf, sizeof(buf));
