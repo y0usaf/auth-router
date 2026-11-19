@@ -7,6 +7,7 @@
 #include "policy.h"
 #include "store.h"
 #include "util.h"
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -270,6 +271,18 @@ static bool parse_route_spec(const char *arg, char *prov, size_t prov_n, char *m
     return true;
 }
 
+static bool is_http_status_str(const char *s, int64_t *out) {
+    if (!s || strlen(s) != 3) return false;
+    if (!isdigit((unsigned char)s[0]) || !isdigit((unsigned char)s[1]) || !isdigit((unsigned char)s[2])) {
+        return false;
+    }
+    int64_t v = 0;
+    if (!str_to_i64(s, &v)) return false;
+    if (v < 100 || v > 599) return false;
+    *out = v;
+    return true;
+}
+
 static bool cmd_json_dispatch(int argc, char **argv, const char *sock_path, bool force_direct, char *err, size_t err_n) {
     if (argc < 1) {
         snprintf(err, err_n, "json requires a subcommand");
@@ -302,15 +315,31 @@ static bool cmd_json_dispatch(int argc, char **argv, const char *sock_path, bool
     } else if (strcmp(sub, "rotate") == 0) {
         j_obj_set(req, "op", j_str("rotate"));
         if (argc >= 2) j_obj_set(req, "provider", j_str(argv[1]));
-    } else if (strcmp(sub, "cool") == 0 && (argc == 3 || argc == 4)) {
+    } else if (strcmp(sub, "cool") == 0 && argc >= 2) {
         j_obj_set(req, "op", j_str("cool"));
         j_obj_set(req, "id", j_str(argv[1]));
-        if (argc == 3) {
+        if (argc == 2) {
+            j_obj_set(req, "model", j_str(""));
+            j_obj_set(req, "status", j_int(429));
+        } else if (argc == 3) {
             j_obj_set(req, "model", j_str(""));
             j_obj_set(req, "duration", j_str(argv[2]));
         } else {
             j_obj_set(req, "model", j_str(argv[2]));
-            j_obj_set(req, "duration", j_str(argv[3]));
+            int64_t st = 0;
+            if (argc > 4 || is_http_status_str(argv[3], &st)) {
+                if (!is_http_status_str(argv[3], &st)) {
+                    j_free(req);
+                    snprintf(err, err_n, "invalid HTTP status: %s", argv[3]);
+                    return false;
+                }
+                j_obj_set(req, "status", j_int(st));
+                jval_t *harr = j_arr();
+                for (int i = 4; i < argc; i++) j_arr_push(harr, j_str(argv[i]));
+                j_obj_set(req, "headers", harr);
+            } else {
+                j_obj_set(req, "duration", j_str(argv[3]));
+            }
         }
     } else if (strcmp(sub, "token") == 0 && argc >= 2) {
         j_obj_set(req, "op", j_str("token"));

@@ -111,6 +111,28 @@ static bool cred_needs_refresh(const cred_t *c, int64_t now, int64_t lead_ms, ch
     return false;
 }
 
+static bool is_core_route_key(const char *k) {
+    static const char *const keys[] = {
+        "v", "ok", "access", "expires", "provider", "login", "login_id",
+        "kind", "credential_id", "model", "http_status", "retry_ms",
+        "retry_s", "primary_retry_ms", "is_fallback", "route_rank",
+        "ready_cnt", "error", "retry", "status"
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (strcmp(k, keys[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void copy_oauth_extra(const jval_t *extra, jval_t *out) {
+    if (!extra || extra->type != J_OBJ) return;
+    for (size_t i = 0; i < extra->obj_len; i++) {
+        const char *k = extra->obj[i].key;
+        if (!k || !k[0] || is_core_route_key(k)) continue;
+        j_obj_set(out, k, j_clone(extra->obj[i].val));
+    }
+}
+
 static bool fill_cred_secret(const cred_t *c, jval_t *out, bool refresh_sync, char *err, size_t err_n) {
     j_obj_set(out, "kind", j_str(c->kind));
     j_obj_set(out, "credential_id", j_str(c->id));
@@ -166,10 +188,12 @@ static bool fill_cred_secret(const cred_t *c, jval_t *out, bool refresh_sync, ch
             }
             j_obj_set(out, "access", j_str(fresh.access));
             j_obj_set(out, "expires", j_int(fresh.expires));
+            copy_oauth_extra(fresh.extra, out);
             oa_tok_free(&fresh);
         } else {
             j_obj_set(out, "access", j_str(tok.access));
             j_obj_set(out, "expires", j_int(tok.expires));
+            copy_oauth_extra(tok.extra, out);
         }
         oa_tok_free(&tok);
         return true;
@@ -182,7 +206,9 @@ static bool fill_cred_secret(const cred_t *c, jval_t *out, bool refresh_sync, ch
             snprintf(err, err_n, "api key %s not found", c->name);
             return false;
         }
-        j_obj_set(out, "api_key", j_str(j_str_at(entry, "key")));
+        const char *k = j_str_at(entry, "key");
+        j_obj_set(out, "api_key", j_str(k));
+        j_obj_set(out, "key", j_str(k));
         j_free(entry);
         return true;
     }
@@ -238,6 +264,7 @@ static jval_t *build_status_or_list(bool include_holds, char *err, size_t err_n)
     j_obj_set(res, "now_ms", j_int(now));
 
     jval_t *arr = j_arr();
+    jval_t *larr = j_arr();
     login_list_t ranked;
     if (auth_rank(&order, &logins, &ranked, err, err_n)) {
         for (size_t i = 0; i < ranked.len; i++) {
@@ -254,6 +281,17 @@ static jval_t *build_status_or_list(bool include_holds, char *err, size_t err_n)
             j_obj_set(item, "expires", j_int(l->expires));
             j_obj_set(item, "health", j_str(health));
             j_arr_push(arr, item);
+
+            const char *st = "expired";
+            if (l->access[0] && l->expires > now) st = "ok";
+            else if (l->refresh[0]) st = "expired-refreshable";
+            jval_t *li = j_obj();
+            j_obj_set(li, "name", j_str(l->name));
+            j_obj_set(li, "provider", j_str("anthropic"));
+            j_obj_set(li, "kind", j_str("login"));
+            j_obj_set(li, "state", j_str(st));
+            j_obj_set(li, "note", j_str(l->access[0] ? health : "pending"));
+            j_arr_push(larr, li);
         }
         login_list_free(&ranked);
     }
@@ -281,10 +319,31 @@ static jval_t *build_status_or_list(bool include_holds, char *err, size_t err_n)
                 char masked[64];
                 ak_mask(j_str_at(entry, "key"), masked, sizeof(masked));
                 j_obj_set(item, "masked", j_str(masked));
+
+                jval_t *li = j_obj();
+                j_obj_set(li, "name", j_str(name));
+                j_obj_set(li, "provider", j_str(prov));
+                j_obj_set(li, "kind", j_str("key"));
+                j_obj_set(li, "state", j_str("ok"));
+                j_obj_set(li, "note", j_str(masked));
+                j_arr_push(larr, li);
             } else if (strcmp(type, "oauth") == 0) {
                 int64_t exp = 0;
                 j_int_at(entry, "expires", &exp);
                 j_obj_set(item, "expires", j_int(exp));
+
+                const char *acc = j_str_at(entry, "access");
+                const char *ref = j_str_at(entry, "refresh");
+                const char *st = "expired";
+                if (acc[0] && (exp == 0 || exp > now)) st = "ok";
+                else if (ref[0]) st = "expired-refreshable";
+                jval_t *li = j_obj();
+                j_obj_set(li, "name", j_str(name));
+                j_obj_set(li, "provider", j_str(prov));
+                j_obj_set(li, "kind", j_str("oauth"));
+                j_obj_set(li, "state", j_str(st));
+                j_obj_set(li, "note", j_str(health));
+                j_arr_push(larr, li);
             } else if (strcmp(type, "acp") == 0) {
                 char note[256];
                 acp_note(name, note, sizeof(note));
@@ -295,6 +354,7 @@ static jval_t *build_status_or_list(bool include_holds, char *err, size_t err_n)
     }
 
     j_obj_set(res, "credentials", arr);
+    j_obj_set(res, "logins", larr);
     j_obj_set(res, "count", j_int((int64_t)arr->arr_len));
 
     if (include_holds) {
@@ -484,6 +544,7 @@ static jval_t *build_route_response(const policy_res_t *pres, const cred_t *cred
         j_obj_set(res, "provider", j_str(pres->provider));
         j_obj_set(res, "model", j_str(pres->model));
         j_obj_set(res, "login_id", j_str(pres->selected_id));
+        j_obj_set(res, "login", j_str(pres->selected_id));
         if (!fill_cred_secret(cred, res, refresh_sync, err, err_n)) {
             j_free(res);
             return NULL;
@@ -492,6 +553,9 @@ static jval_t *build_route_response(const policy_res_t *pres, const cred_t *cred
         j_obj_set(res, "provider", j_str(""));
         j_obj_set(res, "model", j_str(""));
         j_obj_set(res, "login_id", j_str(""));
+        j_obj_set(res, "error", j_str("no login can serve the call"));
+        j_obj_set(res, "retry", j_int(pres->retry_s));
+        j_obj_set(res, "status", j_int(pres->http_status));
     }
     return res;
 }
@@ -625,7 +689,33 @@ static jval_t *exec_non_route_op(const jval_t *req, int64_t started_ms, bool bg_
     if (strcmp(op, "cool") == 0) {
         const char *id = j_str_at(req, "id");
         const char *model = j_str_at(req, "model");
-        if (!id[0]) return make_err("cool requires id");
+        const char *body = j_str_at(req, "body");
+        if (!id[0] || strchr(id, '\t') || strchr(id, '\r') || strchr(id, '\n')) {
+            return make_err("invalid credential id");
+        }
+        char resolved_id[256];
+        snprintf(resolved_id, sizeof(resolved_id), "%s", id);
+        cred_list_t creds = {0};
+        if (auth_credentials(&creds, err, sizeof(err))) {
+            bool exact = false;
+            for (size_t i = 0; i < creds.len; i++) {
+                if (strcmp(creds.items[i].id, id) == 0) {
+                    exact = true;
+                    break;
+                }
+            }
+            if (!exact) {
+                for (size_t i = 0; i < creds.len; i++) {
+                    if (strcmp(creds.items[i].name, id) == 0) {
+                        snprintf(resolved_id, sizeof(resolved_id), "%s", creds.items[i].id);
+                        break;
+                    }
+                }
+            }
+            cred_list_free(&creds);
+        }
+        err[0] = '\0';
+
         int64_t status = 429;
         j_int_at(req, "status", &status);
         int64_t cooldown_ms = AUTH_COOLDOWN_MS;
@@ -637,14 +727,67 @@ static jval_t *exec_non_route_op(const jval_t *req, int64_t started_ms, bool bg_
         } else {
             j_int_at(req, "cooldown_ms", &cooldown_ms);
         }
-        bool limited = false;
-        if (!auth_limit(id, model, (int)status, NULL, 0, cooldown_ms, &limited, err, sizeof(err))) {
-            return make_err(err);
+
+        kv_t hdrs[128];
+        size_t hcnt = 0;
+        jval_t *harr = j_obj_get(req, "headers");
+        if (harr) {
+            if (harr->type != J_ARR) return make_err("headers must be a JSON array");
+            if (harr->arr_len > 128) return make_err("too many headers");
+            for (size_t i = 0; i < harr->arr_len; i++) {
+                jval_t *it = harr->arr[i];
+                if (!it || it->type != J_STR) {
+                    for (size_t j = 0; j < hcnt; j++) { free(hdrs[j].k); free(hdrs[j].v); }
+                    return make_err("header entry must be a string");
+                }
+                size_t slen = strlen(it->s);
+                if (slen > 2048) {
+                    for (size_t j = 0; j < hcnt; j++) { free(hdrs[j].k); free(hdrs[j].v); }
+                    return make_err("header entry too long");
+                }
+                const char *eq = strchr(it->s, '=');
+                if (!eq || eq == it->s) continue;
+                size_t klen = (size_t)(eq - it->s);
+                char *kbuf = (char *)malloc(klen + 1);
+                char *vbuf = (char *)malloc(strlen(eq + 1) + 1);
+                if (!kbuf || !vbuf) {
+                    free(kbuf);
+                    free(vbuf);
+                    for (size_t j = 0; j < hcnt; j++) { free(hdrs[j].k); free(hdrs[j].v); }
+                    return make_err("out of memory");
+                }
+                for (size_t k = 0; k < klen; k++) {
+                    unsigned char ch = (unsigned char)it->s[k];
+                    kbuf[k] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : (char)ch;
+                }
+                kbuf[klen] = '\0';
+                strcpy(vbuf, eq + 1);
+                hdrs[hcnt].k = kbuf;
+                hdrs[hcnt].v = vbuf;
+                hcnt++;
+            }
         }
+
+        bool limited = false;
+        bool ok = auth_limit(resolved_id, model, (int)status, hdrs, hcnt, cooldown_ms, &limited, err, sizeof(err));
+        for (size_t j = 0; j < hcnt; j++) {
+            free(hdrs[j].k);
+            free(hdrs[j].v);
+        }
+        if (!ok) return make_err(err);
+
+        bool missing = false;
+        if (body[0]) {
+            if (!auth_model_missing(resolved_id, model, (int)status, body, &missing, err, sizeof(err))) {
+                return make_err(err);
+            }
+        }
+
         jval_t *r = make_ok();
-        j_obj_set(r, "id", j_str(id));
+        j_obj_set(r, "id", j_str(resolved_id));
         j_obj_set(r, "model", j_str(model));
         j_obj_set(r, "limited", j_bool(limited));
+        j_obj_set(r, "retry", j_bool(limited || missing));
         j_obj_set(r, "cooldown_ms", j_int(cooldown_ms));
         return r;
     }

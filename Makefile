@@ -16,6 +16,7 @@ auth-router: $(SRCS)
 install: auth-router
 	mkdir -p $(PREFIX)/bin
 	install -m 755 auth-router $(PREFIX)/bin/auth-router
+	ln -sf auth-router $(PREFIX)/bin/crest-auth
 
 clean:
 	rm -f auth-router

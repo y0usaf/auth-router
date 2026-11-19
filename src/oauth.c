@@ -237,6 +237,14 @@ bool auth_complete(const login_t *current, const char *code, const char *state, 
     return true;
 }
 
+static void refresh_lock_path(const char *kind, const char *name, char *out, size_t n) {
+    char hex[65];
+    sha256_hex(name ? name : "", hex);
+    char rel[128];
+    snprintf(rel, sizeof(rel), "/refresh-%s-%s.lock", kind, hex);
+    state_path(rel, out, n);
+}
+
 bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
     memset(out, 0, sizeof(*out));
     if (l->expires - AUTH_MARGIN_MS > now_ms()) {
@@ -248,10 +256,18 @@ bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
         return true;
     }
 
+    char rlock[1088];
+    refresh_lock_path("login", l->name, rlock, sizeof(rlock));
+    int rfd = -1;
+    if (!file_lock(rlock, &rfd, err, err_n)) return false;
+
     char lock_path[1088];
     state_path("/logins.lock", lock_path, sizeof(lock_path));
     int fd = -1;
-    if (!file_lock(lock_path, &fd, err, err_n)) return false;
+    if (!file_lock(lock_path, &fd, err, err_n)) {
+        file_unlock(rfd);
+        return false;
+    }
 
     login_list_t cur = {0};
     bool ok = auth_load(&cur, err, err_n);
@@ -284,6 +300,7 @@ bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
 
     if (!ok || already_fresh) {
         free(refresh_tok);
+        file_unlock(rfd);
         return ok;
     }
 
@@ -299,12 +316,16 @@ bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
     int64_t exp = 0;
     ok = auth_token_call(what, p, &acc, &ref, &exp, err, err_n);
     j_free(p);
-    if (!ok) return false;
+    if (!ok) {
+        file_unlock(rfd);
+        return false;
+    }
 
     fd = -1;
     if (!file_lock(lock_path, &fd, err, err_n)) {
         free(acc);
         free(ref);
+        file_unlock(rfd);
         return false;
     }
 
@@ -344,6 +365,7 @@ bool auth_fresh(const login_t *l, login_t *out, char *err, size_t err_n) {
     }
     login_list_free(&cur);
     file_unlock(fd);
+    file_unlock(rfd);
     return ok;
 }
 
@@ -522,12 +544,42 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
         out->extra = j_clone(stored->extra);
         return true;
     }
-    if (!stored->refresh || !stored->refresh[0]) {
-        snprintf(err, err_n, "OAuth login %s has expired and has no refresh token", name);
+
+    char rlock[1088];
+    refresh_lock_path("oauth", name, rlock, sizeof(rlock));
+    int rfd = -1;
+    if (!file_lock(rlock, &rfd, err, err_n)) return false;
+
+    oa_tok_t cur = {0};
+    bool found = false;
+    if (!oa_load(name, &cur, &found, err, err_n)) {
+        file_unlock(rfd);
         return false;
     }
+    if (!found) {
+        snprintf(err, err_n, "OAuth login %s was removed while waiting to refresh", name);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
+        return false;
+    }
+    if (cur.access && cur.access[0] && (cur.expires == 0 || cur.expires > at_ms)) {
+        *out = cur;
+        file_unlock(rfd);
+        return true;
+    }
+    if (!cur.refresh || !cur.refresh[0]) {
+        snprintf(err, err_n, "OAuth login %s has expired and has no refresh token", name);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
+        return false;
+    }
+
     jval_t *entry = NULL;
-    if (!ak_get(name, &entry, err, err_n)) return false;
+    if (!ak_get(name, &entry, err, err_n)) {
+        oa_tok_free(&cur);
+        file_unlock(rfd);
+        return false;
+    }
     const char *prov = entry ? ak_provider(name, entry) : name;
     char prov_copy[128];
     snprintf(prov_copy, sizeof(prov_copy), "%s", prov);
@@ -536,6 +588,8 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
     const char *turl = token_url_for(prov_copy);
     if (!*turl) {
         snprintf(err, err_n, "%s: token refresh URL not configured", prov_copy);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
         return false;
     }
     sb_t form;
@@ -543,7 +597,7 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
     sb_puts(&form, "grant_type=refresh_token&client_id=");
     url_encode(client_id_for(prov_copy), &form);
     sb_puts(&form, "&refresh_token=");
-    url_encode(stored->refresh, &form);
+    url_encode(cur.refresh, &form);
 
     const char *hdrs[2] = {
         "Content-Type: application/x-www-form-urlencoded",
@@ -555,17 +609,23 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
     sb_free(&form);
     if (!ok) {
         snprintf(err, err_n, "%s refresh: %s", name, herr);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
         return false;
     }
     if (resp.status != 200) {
         snprintf(err, err_n, "%s refresh: HTTP %d: %s", name, resp.status, resp.body ? resp.body : "");
         http_resp_free(&resp);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
         return false;
     }
     jval_t *j = j_parse(resp.body ? resp.body : "");
     http_resp_free(&resp);
     if (!j) {
         snprintf(err, err_n, "%s refresh: invalid JSON", name);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
         return false;
     }
     const char *acc = j_str_at(j, "access_token");
@@ -575,14 +635,20 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
     if (!*acc) {
         j_free(j);
         snprintf(err, err_n, "%s refresh: missing access_token", name);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
         return false;
     }
     out->access = xstrdup(acc);
-    out->refresh = xstrdup(*ref ? ref : stored->refresh);
+    out->refresh = xstrdup(*ref ? ref : cur.refresh);
     out->expires = now_ms() + secs * 1000;
-    out->extra = j_clone(stored->extra);
+    out->extra = j_clone(cur.extra);
     j_free(j);
-    return oa_save_named(prov_copy, name, out, err, err_n);
+    bool saved = oa_save_named(prov_copy, name, out, err, err_n);
+    if (!saved) oa_tok_free(out);
+    oa_tok_free(&cur);
+    file_unlock(rfd);
+    return saved;
 }
 
 static bool flows_read(jval_t **out, char *err, size_t err_n) {

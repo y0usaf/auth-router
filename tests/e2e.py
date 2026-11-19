@@ -1245,6 +1245,152 @@ def test_order_lock_atomic_rmw(bin_path, tmp_dir):
     print("PASS atomic /order.lock read-modify-write")
 
 
+
+def test_concurrent_direct_oauth_refresh_serialization(bin_path, tmp_dir):
+    crt, key = gen_self_signed_cert(tmp_dir, "direct_oa")
+    srv, port, state = start_https_token_server(crt, key, delay_s=0.4, chunked=False)
+    sdir = os.path.join(tmp_dir, "direct_oa_serial")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    past = int(time.time() * 1000) - 60_000
+    auth_json = {
+        "xai-main": {
+            "provider": "xai",
+            "type": "oauth",
+            "access": "old-xai",
+            "refresh": "ref-xai",
+            "expires": past,
+            "project": "proj-x",
+            "account_id": "acct-x",
+        }
+    }
+    with open(os.path.join(sdir, "auth.json"), "w") as f:
+        json.dump(auth_json, f)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AUTH_ROUTER_STATE_DIR": sdir,
+        "XAI_OAUTH_TOKEN_URL": f"https://localhost:{port}/token",
+        "AUTH_ROUTER_CA_FILE": crt,
+    }
+    try:
+        p1 = subprocess.Popen(
+            [bin_path, "--direct", "token", "xai", "--json"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        p2 = subprocess.Popen(
+            [bin_path, "--direct", "token", "xai", "--json"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out1, err1 = p1.communicate(timeout=10)
+        out2, err2 = p2.communicate(timeout=10)
+        assert p1.returncode == 0, f"p1 failed: {err1}"
+        assert p2.returncode == 0, f"p2 failed: {err2}"
+        r1 = json.loads(out1)
+        r2 = json.loads(out2)
+        assert r1["access"] == "fresh-tok-1", r1
+        assert r2["access"] == "fresh-tok-1", r2
+        assert r1["project"] == "proj-x" and r1["account_id"] == "acct-x", r1
+        assert r2["project"] == "proj-x" and r2["account_id"] == "acct-x", r2
+        assert state["count"] == 1, f"expected exactly 1 refresh POST, got {state['count']}"
+        print("PASS concurrent --direct OAuth refresh serialization (1 POST)")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_crest_auth_dropin_compat(bin_path, tmp_dir):
+    crest_path = os.path.join(os.path.dirname(bin_path), "crest-auth")
+    assert os.path.islink(crest_path), f"missing crest-auth symlink at {crest_path}"
+    assert os.path.realpath(crest_path) == os.path.realpath(bin_path)
+
+    sdir = os.path.join(tmp_dir, "dropin_compat")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    future = int(time.time() * 1000) + 3_600_000
+    with open(os.path.join(sdir, "logins"), "w") as f:
+        f.write(f"personal\tacc-personal\tref-personal\t{future}\t0\t\n")
+    auth_json = {
+        "codex1": {
+            "provider": "openai-codex",
+            "type": "oauth",
+            "access": "oa-codex-tok",
+            "refresh": "oa-codex-ref",
+            "expires": future,
+            "project": "p-123",
+            "account_id": "acc-456",
+        },
+        "ds1": {
+            "provider": "deepseek",
+            "type": "api_key",
+            "key": "sk-ds-secret",
+        },
+        "acp1": {
+            "provider": "antigravity-acp",
+            "type": "acp",
+        },
+    }
+    with open(os.path.join(sdir, "auth.json"), "w") as f:
+        json.dump(auth_json, f)
+    env = {"AUTH_ROUTER_STATE_DIR": sdir}
+
+    r_list = json.loads(run_cmd(crest_path, ["--direct", "json", "list"], env=env).stdout)
+    logins = r_list["logins"]
+    by_name = {x["name"]: x for x in logins}
+    assert set(by_name.keys()) == {"personal", "codex1", "ds1"}, logins
+    assert by_name["personal"]["kind"] == "login" and by_name["personal"]["state"] == "ok", by_name["personal"]
+    assert by_name["codex1"]["kind"] == "oauth" and by_name["codex1"]["state"] == "ok", by_name["codex1"]
+    assert by_name["ds1"]["kind"] == "key" and by_name["ds1"]["state"] == "ok", by_name["ds1"]
+    cred_names = {x["name"] for x in r_list["credentials"]}
+    assert "acp1" in cred_names, r_list["credentials"]
+
+    r_oa = json.loads(run_cmd(crest_path, ["--direct", "json", "token", "openai-codex"], env=env).stdout)
+    assert r_oa["login"] == "codex1" and r_oa["login_id"] == "codex1", r_oa
+    assert r_oa["access"] == "oa-codex-tok", r_oa
+    assert r_oa["project"] == "p-123" and r_oa["account_id"] == "acc-456", r_oa
+    assert "error" not in r_oa, r_oa
+
+    r_key = json.loads(run_cmd(crest_path, ["--direct", "json", "token", "deepseek"], env=env).stdout)
+    assert r_key["login"] == "ds1" and r_key["login_id"] == "ds1", r_key
+    assert r_key["key"] == "sk-ds-secret" and r_key["api_key"] == "sk-ds-secret", r_key
+    assert "error" not in r_key, r_key
+
+    r_c200 = json.loads(
+        run_cmd(crest_path, ["--direct", "json", "cool", "personal", "claude-sonnet-4", "200"], env=env).stdout
+    )
+    assert r_c200["id"] == "anthropic:personal", r_c200
+    assert r_c200["limited"] is False and r_c200["retry"] is False, r_c200
+
+    r_c429 = json.loads(
+        run_cmd(
+            crest_path,
+            ["--direct", "json", "cool", "personal", "claude-sonnet-4", "429", "retry-after=30"],
+            env=env,
+        ).stdout
+    )
+    assert r_c429["id"] == "anthropic:personal", r_c429
+    assert r_c429["limited"] is True and r_c429["retry"] is True, r_c429
+
+    p_cool = run_cmd(crest_path, ["--direct", "json", "token", "anthropic", "claude-sonnet-4"], env=env)
+    assert p_cool.returncode == 0, p_cool.stderr
+    r_cool = json.loads(p_cool.stdout)
+    assert "error" in r_cool and r_cool["retry"] > 0 and r_cool["retry"] <= 35, r_cool
+    assert r_cool["status"] == 429, r_cool
+
+    r_c1 = json.loads(run_cmd(crest_path, ["--direct", "json", "cool", "ds1"], env=env).stdout)
+    assert r_c1["id"] == "deepseek:ds1", r_c1
+    assert r_c1["limited"] is True and r_c1["retry"] is True, r_c1
+    p_ds = run_cmd(crest_path, ["--direct", "json", "token", "deepseek"], env=env)
+    assert p_ds.returncode == 0
+    r_ds = json.loads(p_ds.stdout)
+    assert "error" in r_ds and r_ds["retry"] > 0, r_ds
+
+    print("PASS crest-auth symlink + drop-in JSON list/token/cool compatibility")
+
+
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
@@ -1265,6 +1411,8 @@ def main():
         test_restricted_now_ms_cool_validation_and_slow_reader(bin_path, tmp)
         test_sigterm_inflight_and_pipelined_refresh(bin_path, tmp)
         test_order_lock_atomic_rmw(bin_path, tmp)
+        test_concurrent_direct_oauth_refresh_serialization(bin_path, tmp)
+        test_crest_auth_dropin_compat(bin_path, tmp)
     print("ALL E2E PASSED")
 
 

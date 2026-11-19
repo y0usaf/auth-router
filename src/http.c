@@ -181,6 +181,7 @@ static int poll_wait_fd(int fd, short events, int64_t deadline_ms) {
             if (errno == EINTR) continue;
             return -1;
         }
+        if (r == 0) continue;
         return r;
     }
 }
