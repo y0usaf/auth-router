@@ -1452,6 +1452,89 @@ def test_crest_auth_dropin_compat(bin_path, tmp_dir):
     print("PASS crest-auth symlink + drop-in JSON list/token/cool compatibility")
 
 
+def test_forked_tls13_children(bin_path, tmp_dir):
+    crt, key = gen_self_signed_cert(
+        tmp_dir, "fork_tls13_ec", key_args=["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
+    )
+    srv, port, st = start_https_token_server(
+        crt, key, delay_s=0.15, chunked=False, tls_version=ssl.TLSVersion.TLSv1_3
+    )
+    sdir = os.path.join(tmp_dir, "fork_tls13_state")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    sock = os.path.join(tmp_dir, "fork_tls13.sock")
+    with open(os.path.join(sdir, "logins"), "w") as f:
+        f.write("acct1\told-1\tref-1\t1000\t0\t\n")
+    with open(os.path.join(sdir, "auth.json"), "w") as f:
+        json.dump(
+            {
+                "xai1": {
+                    "type": "oauth",
+                    "provider": "xai",
+                    "access": "old-xai",
+                    "refresh": "ref-xai",
+                    "expires": 1000,
+                }
+            },
+            f,
+        )
+
+    denv = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AUTH_ROUTER_STATE_DIR": sdir,
+        "CREST_AUTH_TOKEN_URL": f"https://localhost:{port}/token",
+        "XAI_OAUTH_TOKEN_URL": f"https://localhost:{port}/token",
+        "AUTH_ROUTER_CA_FILE": crt,
+    }
+    proc = subprocess.Popen(
+        [
+            bin_path,
+            "daemon",
+            "--socket",
+            sock,
+            "--state-dir",
+            sdir,
+            "--no-bg-refresh",
+        ],
+        env=denv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        ping = wait_for_daemon(bin_path, sock, denv)
+        assert ping["ok"] is True
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(
+                run_cmd,
+                bin_path,
+                ["--socket", sock, "token", "anthropic", "claude-opus-5-5", "--json"],
+                denv,
+            )
+            f2 = ex.submit(
+                run_cmd,
+                bin_path,
+                ["--socket", sock, "token", "xai", "grok-4", "--json"],
+                denv,
+            )
+            r1 = json.loads(f1.result().stdout)
+            r2 = json.loads(f2.result().stdout)
+
+        assert r1["ok"] is True and r1["credential_id"] == "anthropic:acct1", r1
+        assert r2["ok"] is True and r2["credential_id"] == "xai:xai1", r2
+        assert {r1["access"], r2["access"]} == {"fresh-tok-1", "fresh-tok-2"}, (r1, r2)
+        assert st["count"] == 2, st
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        srv.shutdown()
+        srv.server_close()
+
+    print("PASS forked daemon TLS 1.3 children")
+
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
@@ -1475,6 +1558,7 @@ def main():
         test_order_lock_atomic_rmw(bin_path, tmp)
         test_concurrent_direct_oauth_refresh_serialization(bin_path, tmp)
         test_crest_auth_dropin_compat(bin_path, tmp)
+        test_forked_tls13_children(bin_path, tmp)
     print("ALL E2E PASSED")
 
 

@@ -310,12 +310,19 @@ static bool tls_cache_prepare(char *err, size_t err_n) {
             mbedtls_x509_crt_free(&g_tls_cache.cacert);
             mbedtls_ctr_drbg_free(&g_tls_cache.ctr_drbg);
             mbedtls_entropy_free(&g_tls_cache.entropy);
+            mbedtls_psa_crypto_free();
             return false;
         }
         g_tls_cache.initialized = true;
         g_tls_cache.pid = getpid();
     } else if (g_tls_cache.pid != getpid()) {
         pid_t cur = getpid();
+        mbedtls_psa_crypto_free();
+        psa_status_t psa_rc = psa_crypto_init();
+        if (psa_rc != PSA_SUCCESS) {
+            snprintf(err, err_n, "psa_crypto_init failed after fork: %d", (int)psa_rc);
+            return false;
+        }
         int rc = mbedtls_ctr_drbg_reseed(&g_tls_cache.ctr_drbg, (const unsigned char *)&cur, sizeof(cur));
         if (rc != 0) {
             snprintf(err, err_n, "tls drbg reseed failed: -0x%04x", (unsigned)(-rc));
