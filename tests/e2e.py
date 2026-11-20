@@ -285,6 +285,7 @@ def test_tls_and_chunked(bin_path, tmp_dir):
                 check=False,
             )
             assert p_untrusted.returncode != 0, f"{cname}: untrusted cert must fail"
+            assert "certificate verification failed" in p_untrusted.stderr.lower(), f"{cname}: {p_untrusted.stderr}"
             p_good = run_cmd(
                 bin_path,
                 ["--direct", "token", "anthropic", "claude-opus-5-5", "--json"],
