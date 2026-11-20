@@ -48,7 +48,7 @@ def unix_rpc_raw(sock_path, line):
     return json.loads(buf.decode().strip())
 
 
-def gen_self_signed_cert(tmp_dir, name, cn="localhost", san="DNS:localhost,IP:127.0.0.1"):
+def gen_self_signed_cert(tmp_dir, name, cn="localhost", san="DNS:localhost,IP:127.0.0.1", key_args=None):
     key = os.path.join(tmp_dir, f"{name}.key")
     crt = os.path.join(tmp_dir, f"{name}.crt")
     cfg = os.path.join(tmp_dir, f"{name}.cnf")
@@ -64,13 +64,13 @@ def gen_self_signed_cert(tmp_dir, name, cn="localhost", san="DNS:localhost,IP:12
             f"subjectAltName={san}\n"
             "basicConstraints=CA:TRUE\n"
         )
+    kargs = key_args if key_args is not None else ["-newkey", "rsa:2048"]
     subprocess.run(
         [
             "openssl",
             "req",
             "-x509",
-            "-newkey",
-            "rsa:2048",
+            *kargs,
             "-keyout",
             key,
             "-out",
@@ -88,7 +88,7 @@ def gen_self_signed_cert(tmp_dir, name, cn="localhost", san="DNS:localhost,IP:12
     return crt, key
 
 
-def start_https_token_server(crt, key, delay_s=0.0, chunked=False):
+def start_https_token_server(crt, key, delay_s=0.0, chunked=False, tls_version=None):
     state = {"count": 0, "lock": threading.Lock(), "ua_headers": []}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -128,6 +128,9 @@ def start_https_token_server(crt, key, delay_s=0.0, chunked=False):
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if tls_version is not None:
+        ctx.minimum_version = tls_version
+        ctx.maximum_version = tls_version
     ctx.load_cert_chain(certfile=crt, keyfile=key)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     port = srv.server_address[1]
@@ -206,16 +209,19 @@ def wait_for_daemon(bin_path, sock_path, env):
     raise AssertionError("daemon did not become ready")
 
 
-def test_ldd(bin_path):
-    p = subprocess.run(["ldd", bin_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-    allowed = ("linux-vdso.so", "libc.so", "libm.so", "ld-linux")
-    for line in p.stdout.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if not any(a in s for a in allowed):
-            raise AssertionError(f"forbidden shared library in ldd: {s}")
-    print("PASS ldd glibc-only")
+def test_static_binary(bin_path):
+    pd = subprocess.run(["readelf", "-d", bin_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    needed = [ln.strip() for ln in pd.stdout.splitlines() if "(NEEDED)" in ln]
+    assert not needed, f"binary has dynamic NEEDED entries: {needed}"
+
+    pl = subprocess.run(["readelf", "-l", bin_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    interp = [ln.strip() for ln in pl.stdout.splitlines() if "INTERP" in ln]
+    assert not interp, f"binary has PT_INTERP header: {interp}"
+
+    pldd = subprocess.run(["ldd", bin_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    combined = (pldd.stdout + "\n" + pldd.stderr).lower()
+    assert "not a dynamic executable" in combined or "statically linked" in combined, combined
+    print("PASS fully static binary (0 DT_NEEDED, no PT_INTERP)")
 
 
 def test_tls_and_chunked(bin_path, tmp_dir):
@@ -248,10 +254,54 @@ def test_tls_and_chunked(bin_path, tmp_dir):
         assert data["ok"] is True
         assert data["access"] == "fresh-tok-1"
         assert st["count"] == 1
-        print("PASS tls verification + chunked HTTPS + untrusted cert rejection")
     finally:
         srv.shutdown()
         srv.server_close()
+
+    ec_crt, ec_key = gen_self_signed_cert(
+        tmp_dir, "ca_ec", key_args=["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
+    )
+    cases = [
+        ("rsa_tls12", crt1, key1, ssl.TLSVersion.TLSv1_2),
+        ("rsa_tls13", crt1, key1, ssl.TLSVersion.TLSv1_3),
+        ("ec_tls12", ec_crt, ec_key, ssl.TLSVersion.TLSv1_2),
+        ("ec_tls13", ec_crt, ec_key, ssl.TLSVersion.TLSv1_3),
+    ]
+    for cname, ccrt, ckey, tver in cases:
+        csrv, cport, cst = start_https_token_server(ccrt, ckey, delay_s=0.0, chunked=False, tls_version=tver)
+        try:
+            csdir = os.path.join(tmp_dir, f"tls_{cname}")
+            os.makedirs(csdir, mode=0o700, exist_ok=True)
+            with open(os.path.join(csdir, "logins"), "w") as f:
+                f.write("main\told-tok\tref-tok\t1000\t0\t\n")
+            p_untrusted = run_cmd(
+                bin_path,
+                ["--direct", "token", "anthropic", "claude-opus-5-5", "--json"],
+                env={
+                    "AUTH_ROUTER_STATE_DIR": csdir,
+                    "CREST_AUTH_TOKEN_URL": f"https://localhost:{cport}/token",
+                    "SSL_CERT_FILE": crt2,
+                },
+                check=False,
+            )
+            assert p_untrusted.returncode != 0, f"{cname}: untrusted cert must fail"
+            p_good = run_cmd(
+                bin_path,
+                ["--direct", "token", "anthropic", "claude-opus-5-5", "--json"],
+                env={
+                    "AUTH_ROUTER_STATE_DIR": csdir,
+                    "CREST_AUTH_TOKEN_URL": f"https://localhost:{cport}/token",
+                    "SSL_CERT_FILE": ccrt,
+                },
+            )
+            cdata = json.loads(p_good.stdout)
+            assert cdata["ok"] is True and cdata["access"] == "fresh-tok-1", cdata
+            assert cst["count"] == 1
+        finally:
+            csrv.shutdown()
+            csrv.server_close()
+
+    print("PASS tls 1.2 + tls 1.3 (RSA + ECDSA) + chunked HTTPS + untrusted cert rejection")
 
 
 def test_http_tls_adversarial(bin_path, tmp_dir):
@@ -779,7 +829,7 @@ def test_crest_auth_compat(bin_path, tmp_dir):
     print("PASS crest-auth state format and CLI compatibility")
 
 
-def test_sizes(bin_path, closure_size_file):
+def test_sizes(bin_path, closure_size_file, store_paths_file):
     bin_bytes = os.stat(bin_path).st_size
     bin_mib = bin_bytes / (1024.0 * 1024.0)
     print(f"REPORT binary_size={bin_bytes} bytes ({bin_mib:.2f} MiB)")
@@ -789,13 +839,20 @@ def test_sizes(bin_path, closure_size_file):
         closure_mib = closure_bytes / (1024.0 * 1024.0)
         old_crest_mib = 88.2
         c_curl_mib = 66.1
+        glibc_static_mbedtls_mib = 37.5
         print(
-            f"REPORT closure_size={closure_bytes} bytes ({closure_mib:.1f} MiB) "
+            f"REPORT closure_size={closure_bytes} bytes ({closure_mib:.2f} MiB) "
+            f"vs glibc ({glibc_static_mbedtls_mib:.1f} MiB, -{(1.0 - closure_mib / glibc_static_mbedtls_mib) * 100:.1f}%) "
             f"vs crest-auth ({old_crest_mib:.1f} MiB, -{(1.0 - closure_mib / old_crest_mib) * 100:.1f}%) "
             f"vs C+curl ({c_curl_mib:.1f} MiB, -{(1.0 - closure_mib / c_curl_mib) * 100:.1f}%)"
         )
-        assert closure_mib < c_curl_mib, f"closure {closure_mib:.1f} MiB not smaller than C+curl {c_curl_mib} MiB"
-    print("PASS binary + closure size report")
+        assert closure_mib < 2.0, f"closure {closure_mib:.2f} MiB exceeds 2.0 MiB ceiling"
+    if store_paths_file and os.path.exists(store_paths_file):
+        with open(store_paths_file) as f:
+            paths = [ln.strip() for ln in f if ln.strip()]
+        print(f"REPORT store_paths={len(paths)}")
+        assert len(paths) == 1, f"expected exactly 1 runtime store path, got {len(paths)}: {paths}"
+    print("PASS binary + closure size + single store-path check")
 
 
 
@@ -1397,8 +1454,9 @@ def test_crest_auth_dropin_compat(bin_path, tmp_dir):
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
-    test_ldd(bin_path)
-    test_sizes(bin_path, closure_size_file)
+    store_paths_file = sys.argv[3] if len(sys.argv) > 3 else None
+    test_static_binary(bin_path)
+    test_sizes(bin_path, closure_size_file, store_paths_file)
     with tempfile.TemporaryDirectory(prefix="auth-router-e2e-") as tmp:
         test_tls_and_chunked(bin_path, tmp)
         test_http_tls_adversarial(bin_path, tmp)
