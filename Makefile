@@ -7,11 +7,16 @@ LDLIBS ?= $(MBEDTLS_LIBS) -lm
 PREFIX ?= /usr/local
 
 SRCS = src/main.c src/util.c src/json.c src/http.c src/store.c src/policy.c src/oauth.c src/daemon.c
+HDRS = $(wildcard src/*.h)
+OBJS = $(SRCS:.c=.o)
 
 all: auth-router
 
-auth-router: $(SRCS)
-	$(CC) $(CFLAGS) -Isrc -I$(MBEDTLS_DIR)/include $(SRCS) -o $@ $(LDFLAGS) $(LDLIBS)
+%.o: %.c $(HDRS)
+	$(CC) $(CFLAGS) -Isrc -I$(MBEDTLS_DIR)/include -c $< -o $@
+
+auth-router: $(OBJS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS) $(LDLIBS)
 
 install: auth-router
 	mkdir -p $(PREFIX)/bin
@@ -19,6 +24,6 @@ install: auth-router
 	ln -sf auth-router $(PREFIX)/bin/crest-auth
 
 clean:
-	rm -f auth-router
+	rm -f auth-router $(OBJS)
 
 .PHONY: all install clean

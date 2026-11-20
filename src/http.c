@@ -42,7 +42,6 @@ typedef struct {
 typedef struct {
     bool initialized;
     bool ca_loaded;
-    pid_t pid;
     char ca_path[1024];
     mbedtls_x509_crt cacert;
     mbedtls_entropy_context entropy;
@@ -314,21 +313,6 @@ static bool tls_cache_prepare(char *err, size_t err_n) {
             return false;
         }
         g_tls_cache.initialized = true;
-        g_tls_cache.pid = getpid();
-    } else if (g_tls_cache.pid != getpid()) {
-        pid_t cur = getpid();
-        mbedtls_psa_crypto_free();
-        psa_status_t psa_rc = psa_crypto_init();
-        if (psa_rc != PSA_SUCCESS) {
-            snprintf(err, err_n, "psa_crypto_init failed after fork: %d", (int)psa_rc);
-            return false;
-        }
-        int rc = mbedtls_ctr_drbg_reseed(&g_tls_cache.ctr_drbg, (const unsigned char *)&cur, sizeof(cur));
-        if (rc != 0) {
-            snprintf(err, err_n, "tls drbg reseed failed: -0x%04x", (unsigned)(-rc));
-            return false;
-        }
-        g_tls_cache.pid = cur;
     }
 
     const char *path = resolve_ca_bundle_path();

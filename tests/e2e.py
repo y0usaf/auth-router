@@ -1535,6 +1535,83 @@ def test_forked_tls13_children(bin_path, tmp_dir):
 
     print("PASS forked daemon TLS 1.3 children")
 
+def test_sha1_root_ca_chain(bin_path, tmp_dir):
+    root_key = os.path.join(tmp_dir, "sha1_root.key")
+    root_crt = os.path.join(tmp_dir, "sha1_root.crt")
+    root_cfg = os.path.join(tmp_dir, "sha1_root.cnf")
+    leaf_key = os.path.join(tmp_dir, "sha1_leaf.key")
+    leaf_csr = os.path.join(tmp_dir, "sha1_leaf.csr")
+    leaf_crt = os.path.join(tmp_dir, "sha1_leaf.crt")
+    leaf_ext = os.path.join(tmp_dir, "sha1_leaf.ext")
+    with open(root_cfg, "w") as f:
+        f.write(
+            "[req]\n"
+            "distinguished_name=dn\n"
+            "x509_extensions=v3_ca\n"
+            "prompt=no\n"
+            "[dn]\n"
+            "CN=Legacy SHA1 Root CA\n"
+            "[v3_ca]\n"
+            "basicConstraints=critical,CA:TRUE\n"
+            "keyUsage=critical,keyCertSign,cRLSign\n"
+        )
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-sha1",
+            "-newkey", "rsa:2048",
+            "-keyout", root_key, "-out", root_crt,
+            "-days", "2", "-nodes", "-config", root_cfg,
+        ],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [
+            "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", leaf_key, "-out", leaf_csr, "-subj", "/CN=localhost",
+        ],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    with open(leaf_ext, "w") as f:
+        f.write(
+            "basicConstraints=CA:FALSE\n"
+            "subjectAltName=DNS:localhost,IP:127.0.0.1\n"
+            "keyUsage=digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\n"
+        )
+    subprocess.run(
+        [
+            "openssl", "x509", "-req", "-sha256",
+            "-in", leaf_csr, "-CA", root_crt, "-CAkey", root_key,
+            "-CAcreateserial", "-out", leaf_crt, "-days", "2", "-extfile", leaf_ext,
+        ],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    srv, port, st = start_https_token_server(
+        leaf_crt, leaf_key, delay_s=0.0, chunked=False, tls_version=ssl.TLSVersion.TLSv1_3
+    )
+    sdir = os.path.join(tmp_dir, "sha1_root_state")
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    with open(os.path.join(sdir, "logins"), "w") as f:
+        f.write("acct1\told-1\tref-1\t1000\t0\t\n")
+    try:
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "AUTH_ROUTER_STATE_DIR": sdir,
+            "CREST_AUTH_TOKEN_URL": f"https://localhost:{port}/token",
+            "AUTH_ROUTER_CA_FILE": root_crt,
+        }
+        p = run_cmd(bin_path, ["--direct", "token", "anthropic", "claude-opus-5-5", "--json"], env)
+        res = json.loads(p.stdout)
+        assert res["ok"] is True and res["access"] == "fresh-tok-1", res
+        assert st["count"] == 1, st
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    print("PASS SHA-1 root CA + SHA-256 leaf chain verification")
+
+
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
@@ -1559,6 +1636,7 @@ def main():
         test_concurrent_direct_oauth_refresh_serialization(bin_path, tmp)
         test_crest_auth_dropin_compat(bin_path, tmp)
         test_forked_tls13_children(bin_path, tmp)
+        test_sha1_root_ca_chain(bin_path, tmp)
     print("ALL E2E PASSED")
 
 

@@ -31,6 +31,8 @@
                   oldCFlags
                   ++ [
                     "-fzero-init-padding-bits=unions"
+                    "-flto=auto"
+                    "-ffat-lto-objects"
                     "-ffunction-sections"
                     "-fdata-sections"
                     "-fno-asynchronous-unwind-tables"
@@ -131,6 +133,12 @@
                   MBEDTLS_ECP_DP_CURVE448_ENABLED; do
                   python3 scripts/config.py unset "$sym"
                 done
+                for sym in \
+                  MBEDTLS_AES_FEWER_TABLES \
+                  MBEDTLS_SHA256_SMALLER \
+                  MBEDTLS_SHA512_SMALLER; do
+                  python3 scripts/config.py set "$sym"
+                done
               '';
               cmakeFlags =
                 (builtins.filter (f: !(pkgs.lib.hasPrefix "-DCMAKE_C_FLAGS=" f)) oldCmakeFlags)
@@ -152,7 +160,7 @@
             ];
             env = {
               CFLAGS = "-std=c11 -Os -flto -Wall -Wextra -Werror -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables";
-              LDFLAGS = "-static -flto -Wl,--gc-sections -Wl,-s";
+              LDFLAGS = "-static -Os -flto=auto -Wl,--gc-sections -Wl,-s";
             };
             buildFlags = [ "auth-router" ];
             installTargets = [ "install" ];
