@@ -6,7 +6,7 @@ MBEDTLS_LIBS ?= $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a
 LDLIBS ?= $(MBEDTLS_LIBS) -lm
 PREFIX ?= /usr/local
 
-SRCS = src/main.c src/util.c src/json.c src/http.c src/store.c src/policy.c src/oauth.c src/daemon.c
+SRCS = src/main.c src/util.c src/json.c src/http.c src/store.c src/policy.c src/oauth.c src/daemon.c src/quota.c src/atop.c
 HDRS = $(wildcard src/*.h)
 OBJS = $(SRCS:.c=.o)
 
@@ -22,6 +22,7 @@ install: auth-router
 	mkdir -p $(PREFIX)/bin
 	install -m 755 auth-router $(PREFIX)/bin/auth-router
 	ln -sf auth-router $(PREFIX)/bin/crest-auth
+	ln -sf auth-router $(PREFIX)/bin/atop
 
 clean:
 	rm -f auth-router $(OBJS)

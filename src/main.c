@@ -5,6 +5,7 @@
 #include "json.h"
 #include "oauth.h"
 #include "policy.h"
+#include "quota.h"
 #include "store.h"
 #include "util.h"
 #include <ctype.h>
@@ -32,6 +33,7 @@ static const char *USAGE =
     "  cool <id> [model] <duration|ms> [--status N]\n"
     "  token <provider> [model] [--prefer ID] [--top ID] [--rotate-from ID] [--now-ms MS] [--json]\n"
     "  route <provider:model ...> [--exclude-provider P] [--prefer ID] [--top ID] [--rotate-from ID] [--now-ms MS] [--json]\n"
+    "  quota [--json]          (also installed as atop: live quota table)\n"
     "  login [provider] [name]\n"
     "  keys | key <provider> [name] [key] | logout <name> | unkey <name> | acp-confirm <name> <email>\n"
     "  json <subcommand> [args]\n";
@@ -380,6 +382,10 @@ static bool cmd_json_dispatch(int argc, char **argv, const char *sock_path, bool
 }
 
 int main(int argc, char **argv) {
+    const char *base = argc > 0 && argv[0] ? strrchr(argv[0], '/') : NULL;
+    base = base ? base + 1 : (argc > 0 && argv[0] ? argv[0] : "");
+    if (strcmp(base, "atop") == 0) return atop_main(argc - 1, argv + 1, NULL, false, false);
+
     const char *sock_path = NULL;
     const char *state_dir_arg = NULL;
     bool force_direct = false;
@@ -865,6 +871,10 @@ int main(int argc, char **argv) {
         }
         printf("%s is signed in as %s and is the active Antigravity account.\n", rest_v[0], rest_v[1]);
         return 0;
+    }
+
+    if (strcmp(cmd, "quota") == 0) {
+        return atop_main(rest_c, rest_v, sock_path, force_direct, true);
     }
 
     if (strcmp(cmd, "json") == 0) {

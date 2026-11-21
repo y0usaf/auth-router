@@ -1612,6 +1612,261 @@ def test_sha1_root_ca_chain(bin_path, tmp_dir):
     print("PASS SHA-1 root CA + SHA-256 leaf chain verification")
 
 
+def start_quota_server(crt, key):
+    state = {"hits": {}, "lock": threading.Lock(), "slow_vercel": False, "token_posts": 0, "headers": {}}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def reply(self, code, payload, extra=None):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def count(self, key):
+            with state["lock"]:
+                state["hits"][key] = state["hits"].get(key, 0) + 1
+                state["headers"][key] = dict(self.headers.items())
+
+        def do_GET(self):
+            auth = self.headers.get("Authorization", "")
+            if self.path == "/api/oauth/usage":
+                tok = auth.removeprefix("Bearer ")
+                self.count("anthropic:" + tok)
+                if self.headers.get("anthropic-beta") != "oauth-2025-04-20":
+                    return self.reply(400, {"error": "missing beta"})
+                if tok == "tok-b":
+                    return self.reply(429, {"error": "slow down"}, {"Retry-After": "120"})
+                if tok in ("tok-a", "fresh-tok-1"):
+                    return self.reply(200, {
+                        "five_hour": {"utilization": 12.4, "resets_at": "2099-01-01T05:00:00.250000+00:00"},
+                        "seven_day": {"utilization": "40", "resets_at": "2099-01-07T00:00:00Z"},
+                        "seven_day_sonnet": {"utilization": 7, "resets_at": 4070908800},
+                        "seven_day_opus": None,
+                        "limits": [{"kind": "weekly_scoped", "percent": 55, "resets_at": "2099-01-07T00:00:00Z", "scope": {"model": {"display_name": "Fable"}}}],
+                        "extra_usage": {"is_enabled": True, "utilization": 65.2, "used_credits": 136923.0, "monthly_limit": 210000, "currency": "USD", "decimal_places": 2},
+                        "subscription_type": "max",
+                    })
+                return self.reply(401, {"error": "bad token"})
+            if self.path == "/backend-api/wham/usage":
+                self.count("codex")
+                if auth != "Bearer cx-tok" or self.headers.get("chatgpt-account-id") != "acct-1":
+                    return self.reply(403, {"error": "denied"})
+                return self.reply(200, {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 40, "limit_window_seconds": 18000, "reset_at": 4070908800},
+                        "secondary_window": {"used_percent": 7, "limit_window_seconds": 604800, "reset_after_seconds": 3600},
+                    },
+                    "spend_control": {"reached": False, "individual_limit": {"unit": "credit", "limit": "30000", "used": "21800.5", "used_percent": 73, "reset_at": 4070908800}},
+                })
+            if self.path == "/v1/credits":
+                self.count("vercel")
+                if state["slow_vercel"]:
+                    time.sleep(4)
+                if auth != "Bearer vck-secret-123" or self.headers.get("ai-gateway-auth-method") != "api-key":
+                    return self.reply(401, {"error": "denied"})
+                return self.reply(200, {"balance": "12.5", "total_used": "3"})
+            self.reply(404, {})
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length) if length > 0 else b""
+            if self.path == "/token":
+                with state["lock"]:
+                    state["token_posts"] += 1
+                    n = state["token_posts"]
+                return self.reply(200, {"access_token": f"fresh-tok-{n}", "refresh_token": f"fresh-ref-{n}", "expires_in": 3600})
+            if self.path == "/v1internal:retrieveUserQuota":
+                self.count("agy")
+                if self.headers.get("Authorization") != "Bearer agy-access-tok":
+                    return self.reply(401, {"error": "denied"})
+                return self.reply(200, {"buckets": [
+                    {"modelId": "gemini-4-carbon-low", "remainingFraction": 0.75, "resetTime": "2099-01-01T00:00:00Z"},
+                    {"modelId": "gemini-4-carbon-high", "remainingFraction": 0.5, "resetTime": "2099-01-02T00:00:00Z"},
+                    {"modelId": "gemini-4-neon", "resetTime": "2099-01-03T00:00:00Z"},
+                    {"modelId": "internal-feature", "remainingFraction": 1},
+                ]})
+            self.reply(404, {})
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=crt, keyfile=key)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, srv.server_address[1], state
+
+
+def test_quota_and_atop(bin_path, tmp_dir):
+    crt, key = gen_self_signed_cert(tmp_dir, "qcert")
+    srv, port, st = start_quota_server(crt, key)
+    sdir = os.path.join(tmp_dir, "quota_state")
+    os.makedirs(os.path.join(sdir, "antigravity", "gem"), mode=0o700, exist_ok=True)
+    future = int(time.time() * 1000) + 3600000
+    with open(os.path.join(sdir, "logins"), "w") as f:
+        f.write(f"alpha\ttok-a\tref-a\t{future}\t0\t\n")
+        f.write(f"beta\ttok-b\tref-b\t{future}\t0\t\n")
+        f.write("gamma\texpired-tok\tref-gamma\t1000\t0\t\n")
+        f.write("unfin\t\t\t0\t0\tverif\n")
+    with open(os.path.join(sdir, "auth.json"), "w") as f:
+        json.dump({
+            "openai-codex": {"type": "oauth", "provider": "openai-codex", "access": "cx-tok", "refresh": "cx-ref", "expires": future, "extra": {"account_id": "acct-1"}},
+            "vercel-ai-gateway": {"type": "api_key", "key": "vck-secret-123"},
+            "gem": {"type": "acp", "provider": "antigravity-acp"},
+            "deepseek": {"type": "api_key", "provider": "deepseek", "key": "sk-deep-777"},
+        }, f)
+    with open(os.path.join(sdir, "antigravity", "gem", "crest-login.json"), "w") as f:
+        json.dump({"version": 2, "provider": "antigravity-cli", "email": "gem@example.com"}, f)
+    agy = os.path.join(tmp_dir, "agy")
+    for sub, email, tok in (("aaa", "other@example.com", "agy-wrong-tok"), ("bbb", "gem@example.com", "agy-access-tok")):
+        d = os.path.join(agy, "gem", sub, "antigravity-cli")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "antigravity-oauth-token"), "w") as f:
+            json.dump({"token": {"access_token": tok, "refresh_token": "agy-ref", "token_type": "Bearer", "expiry": "2099-01-01T00:00:00.000Z"}, "auth_method": "consumer", "id_token_email": email}, f)
+
+    base = f"https://localhost:{port}"
+    denv = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "AUTH_ROUTER_STATE_DIR": sdir,
+        "AUTH_ROUTER_CA_FILE": crt,
+        "CREST_AUTH_TOKEN_URL": f"{base}/token",
+        "AUTH_ROUTER_ANTHROPIC_USAGE_URL": f"{base}/api/oauth/usage",
+        "CODEX_BASE_URL": f"{base}/backend-api/codex",
+        "AUTH_ROUTER_VERCEL_BASE": base,
+        "GOOGLE_ANTIGRAVITY_URL": base,
+        "AUTH_ROUTER_AGY_ROOT": agy,
+        "AUTH_ROUTER_QUOTA_MIN_MS": "0",
+        "AUTH_ROUTER_QUOTA_TIMEOUT_MS": "1500",
+    }
+    sock = os.path.join(tmp_dir, "quota.sock")
+    rsock = os.path.join(tmp_dir, "quota-r.sock")
+    proc = subprocess.Popen(
+        [bin_path, "daemon", "--socket", sock, "--restricted-socket", rsock, "--state-dir", sdir, "--no-bg-refresh"],
+        env=denv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        wait_for_daemon(bin_path, sock, denv)
+        out = run_cmd(bin_path, ["--socket", sock, "quota", "--json"], env=denv).stdout
+        for secret in ("tok-a", "tok-b", "ref-", "cx-tok", "cx-ref", "vck-secret-123", "agy-access-tok", "agy-ref", "fresh-tok", "sk-deep"):
+            assert secret not in out, f"quota output leaked {secret}"
+        q = json.loads(out)
+        assert q["ok"] is True, q
+        rows = {r["id"]: r for r in q["accounts"]}
+        assert len(rows) == 8, sorted(rows)
+        a = rows["anthropic:alpha"]
+        wins = {w["label"]: w for w in a["windows"]}
+        assert a["status"] == "ok" and a["plan"] == "max", a
+        assert wins["5h"]["used"] == 12 and wins["5h"]["resets_ms"] == 4070926800250, wins["5h"]
+        assert wins["7d"]["used"] == 40 and wins["7d"]["resets_ms"] == 4071427200000, wins["7d"]
+        assert wins["7d sonnet"]["used"] == 7 and wins["7d sonnet"]["resets_ms"] == 4070908800000
+        assert wins["7d Fable"]["used"] == 55 and "7d opus" not in wins
+        assert wins["monthly"]["used"] == 65 and a["note"] == "USD 1369.23/2100.00", a
+        b = rows["anthropic:beta"]
+        assert b["status"] == "error" and b["error"] == "HTTP 429 (rate limited), retry after 120s" and b["retry_after_s"] == 120, b
+        assert b["windows"] == [] and b["next_ms"] - b["fetched_ms"] >= 120000, b
+        g = rows["anthropic:gamma"]
+        assert g["status"] == "ok" and st["token_posts"] == 1, (g, st["token_posts"])
+        with open(os.path.join(sdir, "logins")) as f:
+            assert "fresh-ref-1" in f.read(), "refreshed login must be persisted through the store"
+        u = rows["anthropic:unfin"]
+        assert u["status"] == "error" and "never finished" in u["error"], u
+        c = rows["openai-codex"]
+        cw = {w["label"]: w for w in c["windows"]}
+        assert c["status"] == "ok" and c["plan"] == "plus", c
+        assert cw["5h"]["used"] == 40 and cw["5h"]["resets_ms"] == 4070908800000, cw
+        assert cw["7d"]["used"] == 7 and abs(cw["7d"]["resets_ms"] - (q["now_ms"] + 3600000)) < 60000, cw
+        assert cw["spend"]["used"] == 73 and c["note"] == "21800/30000 credits", c
+        hdr = st["headers"]["codex"]
+        assert hdr.get("originator") == "pi" and hdr.get("chatgpt-account-id") == "acct-1"
+        v = rows["vercel-ai-gateway"]
+        assert v["status"] == "ok" and v["balance"] == "12.50" and v["total_used"] == "3.00", v
+        gm = rows["antigravity-acp:gem"]
+        gw = {w["label"]: w for w in gm["windows"]}
+        assert gm["status"] == "ok" and set(gw) == {"gemini-4-carbon", "gemini-4-neon"}, gm
+        assert gw["gemini-4-carbon"]["used"] == 50 and gw["gemini-4-carbon"]["resets_ms"] == 4070908800000, gw
+        assert gw["gemini-4-neon"]["used"] == 100, gw
+        ds = rows["deepseek"]
+        assert ds["status"] == "unsupported", ds
+
+        b_hits = st["hits"]["anthropic:tok-b"]
+        q2 = json.loads(run_cmd(bin_path, ["--socket", sock, "quota", "--json"], env=denv).stdout)
+        rows2 = {r["id"]: r for r in q2["accounts"]}
+        assert st["hits"]["anthropic:tok-b"] == b_hits, "retry-after must hold the 429 account back"
+        assert rows2["anthropic:beta"].get("cached") is True and rows2["anthropic:beta"]["status"] == "error"
+        assert rows2["deepseek"].get("cached") is True
+        assert st["hits"]["codex"] == 2 and not rows2["openai-codex"].get("cached")
+
+        denied = unix_rpc_raw(rsock, json.dumps({"v": 1, "op": "quota"}))
+        assert denied["ok"] is False and "restricted" in denied["error"], denied
+
+        st["slow_vercel"] = True
+        box = {}
+
+        def slow_call():
+            t0 = time.time()
+            box["out"] = run_cmd(bin_path, ["--socket", sock, "quota", "--json"], env=denv).stdout
+            box["elapsed"] = time.time() - t0
+
+        th = threading.Thread(target=slow_call)
+        th.start()
+        time.sleep(0.3)
+        t0 = time.time()
+        ping = unix_rpc_raw(sock, json.dumps({"v": 1, "op": "ping"}))
+        assert ping["ok"] is True and time.time() - t0 < 1.0, "daemon must stay responsive during a quota round"
+        th.join(timeout=20)
+        q3 = json.loads(box["out"])
+        rows3 = {r["id"]: r for r in q3["accounts"]}
+        assert box["elapsed"] < 3.5, f"slow provider stalled the view: {box['elapsed']:.2f}s"
+        assert rows3["vercel-ai-gateway"]["status"] == "error" and "timed out" in rows3["vercel-ai-gateway"]["error"], rows3["vercel-ai-gateway"]
+        assert rows3["anthropic:alpha"]["status"] == "ok" and rows3["openai-codex"]["status"] == "ok"
+        time.sleep(4)
+        st["slow_vercel"] = False
+
+        atop = os.path.join(os.path.dirname(bin_path), "atop")
+        assert os.path.islink(atop) and os.readlink(atop) == "auth-router", "atop must be a symlink to auth-router"
+        t0 = time.time()
+        table = run_cmd(atop, ["--socket", sock], env=denv).stdout
+        assert time.time() - t0 < 5
+        assert "\x1b" not in table, "piped atop must not emit terminal escapes"
+        lines = table.splitlines()
+        assert lines[0].split()[:3] == ["PROVIDER", "ACCOUNT", "WINDOW"], lines[0]
+        alpha = next(l for l in lines if " alpha " in l)
+        assert "5h" in alpha and "12%" in alpha and "#---------" in alpha, alpha
+        beta = next(l for l in lines if " beta " in l)
+        assert "error" in beta and "HTTP 429" in beta, beta
+        assert any("balance $12.50" in l for l in lines), table
+        assert any("gemini-4-neon" in l and "100%" in l and "##########" in l for l in lines), table
+        for secret in ("tok-a", "cx-tok", "vck-secret-123", "agy-access-tok"):
+            assert secret not in table
+        aj = json.loads(run_cmd(atop, ["--socket", sock, "--json"], env=denv).stdout)
+        assert aj["ok"] is True and len(aj["accounts"]) == 8
+
+        st["slow_vercel"] = True
+        dt0 = time.time()
+        dq = json.loads(run_cmd(bin_path, ["--state-dir", sdir, "--direct", "quota", "--json"], env=denv).stdout)
+        assert time.time() - dt0 < 3.5, "direct mode must not wait on an abandoned probe"
+        assert {r["id"]: r for r in dq["accounts"]}["vercel-ai-gateway"]["status"] == "error"
+        st["slow_vercel"] = False
+        print("PASS quota op + atop table + parsers + retry-after cache + refresh lock + timeout isolation + restricted denial")
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        srv.shutdown()
+        srv.server_close()
+
+
 def main():
     bin_path = sys.argv[1]
     closure_size_file = sys.argv[2] if len(sys.argv) > 2 else None
@@ -1637,6 +1892,7 @@ def main():
         test_crest_auth_dropin_compat(bin_path, tmp)
         test_forked_tls13_children(bin_path, tmp)
         test_sha1_root_ca_chain(bin_path, tmp)
+        test_quota_and_atop(bin_path, tmp)
     print("ALL E2E PASSED")
 
 

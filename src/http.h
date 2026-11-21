@@ -9,6 +9,7 @@ typedef struct {
     int status;
     char *body;
     size_t body_len;
+    char retry_after[64];
 } http_resp_t;
 
 bool http_request(const char *method,

@@ -501,7 +501,9 @@ static bool parse_http_response(const char *raw,
         size_t clen = (llen < sizeof(line) - 1) ? llen : sizeof(line) - 1;
         memcpy(line, p, clen);
         line[clen] = '\0';
-        if (header_prefix_ci(line, "transfer-encoding")) {
+        if (header_prefix_ci(line, "retry-after")) {
+            snprintf(out->retry_after, sizeof(out->retry_after), "%s", str_trim(line + 12));
+        } else if (header_prefix_ci(line, "transfer-encoding")) {
             if (str_contains_ci(line + 18, "chunked")) chunked = true;
         } else if (header_prefix_ci(line, "content-length")) {
             char *v = str_trim(line + 15);
@@ -772,6 +774,7 @@ void http_resp_free(http_resp_t *r) {
     r->body = NULL;
     r->body_len = 0;
     r->status = 0;
+    r->retry_after[0] = '\0';
 }
 
 bool callback_open(const char *host, int port, int *sock_out, int *actual_port, char *err, size_t err_n) {

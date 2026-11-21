@@ -3,6 +3,7 @@
 #include "daemon.h"
 #include "oauth.h"
 #include "policy.h"
+#include "quota.h"
 #include "store.h"
 #include "util.h"
 #include <dirent.h>
@@ -911,6 +912,11 @@ jval_t *router_exec_direct(const jval_t *req, bool restricted) {
     if (restricted && !op_allowed_restricted(op)) {
         return make_err("restricted socket: operation not permitted");
     }
+    if (strcmp(op, "quota") == 0) {
+        jval_t *q = quota_collect();
+        quota_cache_absorb(q);
+        return q;
+    }
 
     char lock_path[1088];
     char err[512];
@@ -1031,6 +1037,20 @@ static int find_job(refresh_job_t *jobs, const char *kind, const char *name) {
     return -1;
 }
 
+static void write_json_fd(int fd, const jval_t *v) {
+    char *s = j_show(v);
+    if (!s) return;
+    size_t len = strlen(s);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, s + off, len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    free(s);
+}
+
 static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *name, int64_t lead_ms, char *err, size_t err_n) {
     int slot = -1;
     for (int i = 0; i < MAX_JOBS; i++) {
@@ -1064,6 +1084,13 @@ static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
         close_inherited_fds_except(pfd[1]);
+        if (strcmp(kind, "quota") == 0) {
+            jval_t *q = quota_collect();
+            write_json_fd(pfd[1], q);
+            j_free(q);
+            close(pfd[1]);
+            _exit(0);
+        }
         jval_t *out = j_obj();
         char werr[512];
         werr[0] = '\0';
@@ -1112,17 +1139,7 @@ static int start_refresh_job(refresh_job_t *jobs, const char *kind, const char *
             j_obj_set(out, "error", j_str(werr[0] ? werr : "refresh failed"));
         }
 
-        char *s = j_show(out);
-        if (s) {
-            size_t len = strlen(s);
-            size_t off = 0;
-            while (off < len) {
-                ssize_t w = write(pfd[1], s + off, len - off);
-                if (w <= 0) break;
-                off += (size_t)w;
-            }
-            free(s);
-        }
+        write_json_fd(pfd[1], out);
         j_free(out);
         close(pfd[1]);
         _exit(0);
@@ -1165,6 +1182,9 @@ static void finish_refresh_job(refresh_job_t *job,
     int64_t expires = 0;
     if (ok) j_int_at(parsed, "expires", &expires);
     const char *rerr = (!ok && parsed) ? j_str_at(parsed, "error") : "refresh worker failed";
+    bool is_quota = strcmp(job->kind, "quota") == 0;
+    bool quota_ok = is_quota && parsed && parsed->type == J_OBJ;
+    if (quota_ok) quota_cache_absorb(parsed);
 
     int drain_idx[MAX_WAITERS];
     uint64_t drain_conn[MAX_WAITERS];
@@ -1179,7 +1199,15 @@ static void finish_refresh_job(refresh_job_t *job,
             client_t *c = &clients[w->client_idx];
             c->waiting_refresh = false;
             c->last_activity_ms = done_now;
-            if (ok) {
+            if (is_quota) {
+                if (quota_ok) {
+                    client_queue_json(c, parsed);
+                } else {
+                    jval_t *er = make_err("quota worker failed");
+                    client_queue_json(c, er);
+                    j_free(er);
+                }
+            } else if (ok) {
                 jval_t *res = make_ok();
                 j_obj_set(res, "http_status", j_int(w->pres.http_status));
                 j_obj_set(res, "retry_ms", j_int(0));
@@ -1364,6 +1392,27 @@ static void handle_client_line(client_t *clients,
         jval_t *er = make_err("restricted socket: operation not permitted");
         client_queue_json(c, er);
         j_free(er);
+        return;
+    }
+
+    if (strcmp(op, "quota") == 0) {
+        char err[256];
+        err[0] = '\0';
+        int jidx = find_job(jobs, "quota", "");
+        if (jidx < 0) jidx = start_refresh_job(jobs, "quota", "", 0, err, sizeof(err));
+        if (jidx >= 0 && jobs[jidx].waiter_cnt < MAX_WAITERS) {
+            refresh_waiter_t *w = &jobs[jidx].waiters[jobs[jidx].waiter_cnt++];
+            memset(w, 0, sizeof(*w));
+            w->client_idx = cidx;
+            w->conn_id = c->conn_id;
+            c->waiting_refresh = true;
+            j_free(req);
+            return;
+        }
+        jval_t *er = make_err(err[0] ? err : "too many quota waiters");
+        client_queue_json(c, er);
+        j_free(er);
+        j_free(req);
         return;
     }
 
