@@ -85,7 +85,7 @@ typedef struct {
     bool err;
 } line_t;
 
-enum { R_WIN, R_BAL, R_SUM, R_TEXT };
+enum { R_WIN, R_BAL, R_TEXT };
 
 typedef struct {
     int kind;
@@ -240,11 +240,118 @@ static jval_t *fetch(const char *sock_path, bool force_direct, char *err, size_t
     return resp;
 }
 
+static const struct {
+    const char *label;
+    const char *joins;
+} POOL_LABELS[] = {{"gemini-4-neon", NULL}, {"claude-opus-5-5", "anthropic"}};
+
+#define N_POOL_LABELS (sizeof(POOL_LABELS) / sizeof(POOL_LABELS[0]))
+
+static bool pool_key(const jval_t *w, int64_t *used, int64_t *reset) {
+    return j_int_at(w, "used", used) && j_int_at(w, "resets_ms", reset) && *reset > 0;
+}
+
+static bool pool_same(const jval_t *a, const jval_t *b) {
+    int64_t ua = 0, ra = 0, ub = 0, rb = 0;
+    return pool_key(a, &ua, &ra) && pool_key(b, &ub, &rb) && ua == ub && ra == rb;
+}
+
+static size_t pool_first(const jval_t *wins, size_t w) {
+    for (size_t k = 0; k < w; k++) {
+        if (pool_same(wins->arr[k], wins->arr[w])) return k;
+    }
+    return w;
+}
+
+static size_t pool_rep(const jval_t *wins, size_t head, size_t *members, size_t *rank_out) {
+    size_t rep = head, rank = N_POOL_LABELS;
+    *members = 0;
+    for (size_t w = head; w < wins->arr_len; w++) {
+        if (w != head && !pool_same(wins->arr[head], wins->arr[w])) continue;
+        (*members)++;
+        for (size_t i = 0; i < rank; i++) {
+            if (strcmp(j_str_at(wins->arr[w], "label"), POOL_LABELS[i].label) == 0) {
+                rank = i;
+                rep = w;
+            }
+        }
+    }
+    *rank_out = rank;
+    return rep;
+}
+
+static size_t pool_label(const jval_t *wins, size_t head, char *out, size_t n) {
+    size_t members = 0, rank = 0;
+    size_t rep = pool_rep(wins, head, &members, &rank);
+    char l[64];
+    clean_copy(l, sizeof(l), j_str_at(wins->arr[rep], "label"));
+    if (members > 1) snprintf(out, n, "%.40s +%zu", l, members - 1);
+    else snprintf(out, n, "%s", l);
+    return rep;
+}
+
+static const char *pool_target(const jval_t *accs, const jval_t *a, const jval_t *wins, size_t head) {
+    size_t members = 0, rank = 0;
+    pool_rep(wins, head, &members, &rank);
+    const char *to = rank < N_POOL_LABELS ? POOL_LABELS[rank].joins : NULL;
+    if (!to || strcmp(to, j_str_at(a, "provider")) == 0) return NULL;
+    for (size_t k = 0; k < accs->arr_len; k++) {
+        if (strcmp(j_str_at(accs->arr[k], "provider"), to) == 0) return to;
+    }
+    return NULL;
+}
+
+static bool first_of_provider(const jval_t *accs, size_t i) {
+    for (size_t k = 0; k < i; k++) {
+        if (strcmp(j_str_at(accs->arr[k], "provider"), j_str_at(accs->arr[i], "provider")) == 0) return false;
+    }
+    return true;
+}
+
+static const jval_t *ok_windows(const jval_t *a) {
+    const jval_t *wins = j_obj_get(a, "windows");
+    return strcmp(j_str_at(a, "status"), "ok") == 0 && wins && wins->type == J_ARR ? wins : NULL;
+}
+
+static void pool_line(line_t *l, const jval_t *wins, size_t w, int64_t now) {
+    const jval_t *wv = wins->arr[w];
+    pool_label(wins, w, l->win, sizeof(l->win));
+    int64_t used = 0;
+    if (j_int_at(wv, "used", &used)) {
+        l->pct = used;
+        l->has_pct = true;
+        snprintf(l->used, sizeof(l->used), "%lld%%", (long long)used);
+    } else {
+        snprintf(l->used, sizeof(l->used), "?");
+    }
+    int64_t rs = 0;
+    if (j_int_at(wv, "resets_ms", &rs) && rs > 0) fmt_left(rs - now, l->resets, sizeof(l->resets));
+}
+
+static size_t joined_lines(const jval_t *accs, const char *to, line_t *lines, size_t n, size_t max, int64_t now) {
+    for (size_t j = 0; j < accs->arr_len && n < max; j++) {
+        const jval_t *a = accs->arr[j];
+        const jval_t *wins = ok_windows(a);
+        for (size_t w = 0; wins && w < wins->arr_len && n < max; w++) {
+            const char *t = pool_first(wins, w) == w ? pool_target(accs, a, wins, w) : NULL;
+            if (!t || strcmp(t, to) != 0) continue;
+            line_t *l = &lines[n++];
+            memset(l, 0, sizeof(*l));
+            pool_line(l, wins, w, now);
+            clean_copy(l->prov, sizeof(l->prov), j_str_at(a, "provider"));
+            clean_copy(l->acct, sizeof(l->acct), j_str_at(a, "name"));
+        }
+    }
+    return n;
+}
+
 static size_t build_lines(const jval_t *resp, line_t *lines, size_t max, int64_t now) {
     size_t n = 0;
     const jval_t *accs = j_obj_get(resp, "accounts");
     for (size_t i = 0; accs && accs->type == J_ARR && i < accs->arr_len && n < max; i++) {
         const jval_t *a = accs->arr[i];
+        if (first_of_provider(accs, i)) n = joined_lines(accs, j_str_at(a, "provider"), lines, n, max, now);
+        if (n >= max) break;
         const char *status = j_str_at(a, "status");
         char head[256];
         head[0] = '\0';
@@ -283,20 +390,10 @@ static size_t build_lines(const jval_t *resp, line_t *lines, size_t max, int64_t
                 n++;
             }
             for (size_t w = 0; wins && wins->type == J_ARR && w < wins->arr_len && n < max; w++) {
-                const jval_t *wv = wins->arr[w];
+                if (pool_first(wins, w) != w || pool_target(accs, a, wins, w)) continue;
                 l = &lines[n];
                 memset(l, 0, sizeof(*l));
-                clean_copy(l->win, sizeof(l->win), j_str_at(wv, "label"));
-                int64_t used = 0;
-                if (j_int_at(wv, "used", &used)) {
-                    l->pct = used;
-                    l->has_pct = true;
-                    snprintf(l->used, sizeof(l->used), "%lld%%", (long long)used);
-                } else {
-                    snprintf(l->used, sizeof(l->used), "?");
-                }
-                int64_t rs = 0;
-                if (j_int_at(wv, "resets_ms", &rs) && rs > 0) fmt_left(rs - now, l->resets, sizeof(l->resets));
+                pool_line(l, wins, w, now);
                 if (n == first) snprintf(l->note, sizeof(l->note), "%s", head);
                 n++;
             }
@@ -645,31 +742,68 @@ static void join(char *out, size_t n, const char *a) {
     snprintf(out + l, n - l, "%s%s", l ? " · " : "", a);
 }
 
-static size_t label_lcp(const jval_t *wins, size_t first, bool (*pick)(const jval_t *)) {
-    const char *ref = NULL;
-    size_t lcp = 0;
-    for (size_t w = first; w < wins->arr_len; w++) {
-        if (!pick(wins->arr[w])) continue;
-        const char *l = j_str_at(wins->arr[w], "label");
-        if (!ref) {
-            ref = l;
-            lcp = strlen(l);
-            continue;
-        }
-        size_t k = 0;
-        while (k < lcp && l[k] && l[k] == ref[k]) k++;
-        lcp = k;
+static bool win_row(const char *id, const jval_t *wins, size_t w, bool pooled, int64_t now) {
+    const jval_t *wv = wins->arr[w];
+    row_t *r = row_new(R_WIN);
+    if (!r) return false;
+    char rl[64];
+    if (pooled) {
+        clean_copy(rl, sizeof(rl), j_str_at(wins->arr[pool_label(wins, w, r->label, sizeof(r->label))], "label"));
+    } else {
+        clean_copy(r->label, sizeof(r->label), j_str_at(wv, "label"));
+        snprintf(rl, sizeof(rl), "%s", r->label);
     }
-    while (lcp > 0 && ref[lcp - 1] != '-' && ref[lcp - 1] != '.' && ref[lcp - 1] != '/') lcp--;
-    for (size_t w = first; ref && lcp && w < wins->arr_len; w++) {
-        if (pick(wins->arr[w]) && strlen(j_str_at(wins->arr[w], "label")) <= lcp) return 0;
+    int64_t u = 0;
+    if (j_int_at(wv, "used", &u)) {
+        r->has_pct = true;
+        r->pct = u;
+        r->frac = u <= 0 ? 0.0 : u >= 100 ? 1.0 : (double)u / 100.0;
+        snprintf(r->value, sizeof(r->value), "%lld%%", (long long)u);
+    } else {
+        snprintf(r->value, sizeof(r->value), "?");
     }
-    return lcp;
+    int64_t rs = 0;
+    if (j_int_at(wv, "resets_ms", &rs) && rs > 0) fmt_left(rs - now, r->right, sizeof(r->right));
+    r->series = hist_find(id, rl);
+    return true;
 }
 
-static bool exhausted(const jval_t *w) {
-    int64_t u = 0;
-    return j_int_at(w, "used", &u) && u >= 100;
+static void box_title(box_t *b, const jval_t *a) {
+    char prov[48], name[48];
+    clean_copy(prov, sizeof(prov), j_str_at(a, "provider"));
+    clean_copy(name, sizeof(name), j_str_at(a, "name"));
+    if (!name[0] || strcmp(prov, name) == 0) snprintf(b->title, sizeof(b->title), "%s", prov[0] ? prov : name);
+    else snprintf(b->title, sizeof(b->title), "%s · %s", prov, name);
+}
+
+static void joined_boxes(const jval_t *accs, const char *to, int64_t now, bool expanded) {
+    for (size_t j = 0; j < accs->arr_len; j++) {
+        const jval_t *a = accs->arr[j];
+        const jval_t *wins = ok_windows(a);
+        char id[96];
+        clean_copy(id, sizeof(id), j_str_at(a, "id"));
+        for (size_t w = 0; wins && w < wins->arr_len; w++) {
+            const char *t = pool_first(wins, w) == w ? pool_target(accs, a, wins, w) : NULL;
+            if (!t || strcmp(t, to) != 0) continue;
+            if (g_nboxes >= MAX_BOXES) return;
+            box_t *b = &g_boxes[g_nboxes];
+            memset(b, 0, sizeof(*b));
+            box_title(b, a);
+            b->panel = panel_of(to);
+            b->hue = FG(HUES[fnv(to) % (sizeof(HUES) / sizeof(HUES[0]))]);
+            b->r0 = g_nrows;
+            for (size_t m = w; m < wins->arr_len; m++) {
+                if (pool_first(wins, m) != w) continue;
+                if (m != w) {
+                    b->collapsible = true;
+                    if (!expanded) continue;
+                }
+                if (!win_row(id, wins, m, !expanded, now)) break;
+            }
+            b->rn = g_nrows - b->r0;
+            g_nboxes++;
+        }
+    }
 }
 
 static void build_model(const jval_t *resp, int64_t now, bool expanded) {
@@ -679,14 +813,14 @@ static void build_model(const jval_t *resp, int64_t now, bool expanded) {
     const jval_t *accs = j_obj_get(resp, "accounts");
     for (size_t i = 0; accs && accs->type == J_ARR && i < accs->arr_len && g_nboxes < MAX_BOXES; i++) {
         const jval_t *a = accs->arr[i];
+        if (first_of_provider(accs, i)) joined_boxes(accs, j_str_at(a, "provider"), now, expanded);
+        if (g_nboxes >= MAX_BOXES) break;
         box_t *b = &g_boxes[g_nboxes];
         memset(b, 0, sizeof(*b));
-        char prov[48], name[48], id[96];
+        char prov[48], id[96];
         clean_copy(prov, sizeof(prov), j_str_at(a, "provider"));
-        clean_copy(name, sizeof(name), j_str_at(a, "name"));
         clean_copy(id, sizeof(id), j_str_at(a, "id"));
-        if (!name[0] || strcmp(prov, name) == 0) snprintf(b->title, sizeof(b->title), "%s", prov[0] ? prov : name);
-        else snprintf(b->title, sizeof(b->title), "%s · %s", prov, name);
+        box_title(b, a);
         b->panel = panel_of(prov);
         b->hue = FG(HUES[fnv(prov) % (sizeof(HUES) / sizeof(HUES[0]))]);
         b->r0 = g_nrows;
@@ -719,53 +853,14 @@ static void build_model(const jval_t *resp, int64_t now, bool expanded) {
         join(b->info, sizeof(b->info), age);
         const jval_t *wins = j_obj_get(a, "windows");
         size_t nw = wins && wins->type == J_ARR ? wins->arr_len : 0;
-        size_t nex = 0;
-        for (size_t w = 0; w < nw; w++) nex += exhausted(wins->arr[w]);
-        bool collapse = nw > 4 && nex >= 2;
-        b->collapsible = collapse;
-        if (collapse && expanded) collapse = false;
-        int64_t ex_reset = 0;
         for (size_t w = 0; w < nw; w++) {
-            const jval_t *wv = wins->arr[w];
-            int64_t rs = 0;
-            bool has_rs = j_int_at(wv, "resets_ms", &rs) && rs > 0;
-            if (collapse && exhausted(wv)) {
-                if (has_rs && (!ex_reset || rs < ex_reset)) ex_reset = rs;
-                continue;
+            size_t head = pool_first(wins, w);
+            if (pool_target(accs, a, wins, head)) continue;
+            if (head != w) {
+                b->collapsible = true;
+                if (!expanded) continue;
             }
-            row_t *r = row_new(R_WIN);
-            if (!r) break;
-            clean_copy(r->label, sizeof(r->label), j_str_at(wv, "label"));
-            int64_t u = 0;
-            if (j_int_at(wv, "used", &u)) {
-                r->has_pct = true;
-                r->pct = u;
-                r->frac = u <= 0 ? 0.0 : u >= 100 ? 1.0 : (double)u / 100.0;
-                snprintf(r->value, sizeof(r->value), "%lld%%", (long long)u);
-            } else {
-                snprintf(r->value, sizeof(r->value), "?");
-            }
-            if (has_rs) fmt_left(rs - now, r->right, sizeof(r->right));
-            r->series = hist_find(id, r->label);
-        }
-        if (collapse) {
-            row_t *r = row_new(R_SUM);
-            if (r) {
-                snprintf(r->label, sizeof(r->label), "%zu exhausted", nex);
-                r->pct = 100;
-                r->has_pct = true;
-                size_t lcp = label_lcp(wins, 0, exhausted);
-                size_t tl = 0;
-                for (size_t w = 0; w < nw; w++) {
-                    if (!exhausted(wins->arr[w])) continue;
-                    char l[64];
-                    clean_copy(l, sizeof(l), j_str_at(wins->arr[w], "label") + lcp);
-                    int k = snprintf(r->text + tl, sizeof(r->text) - tl, "%s%s", tl ? " " : "", l);
-                    if (k < 0 || (size_t)k >= sizeof(r->text) - tl) break;
-                    tl += (size_t)k;
-                }
-                if (ex_reset) fmt_left(ex_reset - now, r->right, sizeof(r->right));
-            }
+            if (!win_row(id, wins, w, !expanded, now)) break;
         }
         double bal = 0, tu = 0;
         bool has_bal = parse_num(j_str_at(a, "balance"), &bal);
@@ -1059,21 +1154,16 @@ static void draw_box(const box_t *b, bool expanded, int g) {
             continue;
         }
         bool pct = r->kind != R_BAL;
-        put_str(ix, y, r->label, lw, r->kind == R_SUM ? C_DIM : C_TEXT, 0);
+        put_str(ix, y, r->label, lw, C_TEXT, 0);
         int x = ix + lw + 1;
-        if (r->kind == R_SUM) {
-            put_str(x, y, r->text, iw - lw - 1 - (rw ? rw + 1 : 0) - (tall && r->right[0] ? ulen(r->right) + 1 : 0), C_DIM, 0);
-            if (tall && r->right[0]) put_rpad(ix + iw - ulen(r->right), y, r->right, ulen(r->right), C_DIM, 0);
-        } else {
-            draw_meter(x, y, mw, r->frac, pct, b->hue);
-            uint32_t vfg = pct && r->has_pct ? grad(r->frac) : pct ? C_DIM : C_TEXT;
-            put_rpad(x + mw + 1, y, r->value, vw, vfg, r->has_pct && r->pct >= 90 ? A_BOLD : 0);
-            if (sw && r->series >= 0) draw_spark(x + mw + 1 + vw + 1, y, sw, rl, &g_hist[r->series], pct, b->hue);
-            if (tall && r->right[0]) {
-                char t[64];
-                snprintf(t, sizeof(t), "%s%s", r->kind == R_WIN ? "resets in " : "", r->right);
-                put_str(x, y + 1, t, mw + 1 + vw, C_DIM, 0);
-            }
+        draw_meter(x, y, mw, r->frac, pct, b->hue);
+        uint32_t vfg = pct && r->has_pct ? grad(r->frac) : pct ? C_DIM : C_TEXT;
+        put_rpad(x + mw + 1, y, r->value, vw, vfg, r->has_pct && r->pct >= 90 ? A_BOLD : 0);
+        if (sw && r->series >= 0) draw_spark(x + mw + 1 + vw + 1, y, sw, rl, &g_hist[r->series], pct, b->hue);
+        if (tall && r->right[0]) {
+            char t[64];
+            snprintf(t, sizeof(t), "%s%s", r->kind == R_WIN ? "resets in " : "", r->right);
+            put_str(x, y + 1, t, mw + 1 + vw, C_DIM, 0);
         }
         if (rw) put_rpad(ix + iw - rw, y, r->right, rw, C_DIM, 0);
         y += rl;
@@ -1266,7 +1356,7 @@ static void draw_help(void) {
         {"q", "quit"},
         {"r", "refresh now (daemon still rate-limits)"},
         {"1-4", "show or hide a panel"},
-        {"e", "expand or collapse exhausted models"},
+        {"e", "expand or collapse shared quota pools"},
         {"+ -", "refresh interval"},
         {"h", "close help"},
     };
