@@ -6,7 +6,13 @@ Because it is statically linked against musl, DNS and host resolution read `/etc
 
 ## Quotas (`atop`)
 
-`auth-router quota [--json]` reads live usage for every stored credential: Anthropic OAuth windows (5-hour, 7-day, per-model weekly, monthly extra usage), Codex windows and spend control, Vercel AI Gateway credits, and Antigravity per-model quota. The same binary installed as `atop` prints a compact table; on a terminal it redraws every 60 seconds until `q` or Ctrl-C, and when piped it prints once. `atop --json` prints the machine form.
+`auth-router quota [--json]` reads live usage for every stored credential: Anthropic OAuth windows (5-hour, 7-day, per-model weekly, monthly extra usage), Codex windows and spend control, Vercel AI Gateway credits, and Antigravity per-model quota. The same binary installed as `atop` prints a compact table when piped (or with `--once`), and `atop --json` prints the machine form.
+
+On a terminal `atop` is a full-screen view in the spirit of btop: one rounded box per account with the provider's panel number in its title, a gradient meter, percentage, reset countdown and braille usage history for every window, and a balance bar for money and credit budgets. Exhausted models collapse into one summary line when an account reports more than four windows. Boxes flow into balanced columns by width; spare height turns the one-line history into taller graphs, and too little height trims rows to `+N more` before whole boxes move off-screen. Fetches run in a child process so keys stay live, only changed cells are redrawn, and the terminal is restored on exit, suspend, `SIGTERM` and crashes. `NO_COLOR` drops colour; `COLORTERM=truecolor` enables 24-bit colour.
+
+Keys: `q` quit, `r` refresh now (the daemon still rate-limits), `1`-`4` show or hide a provider panel, `e` expand or collapse exhausted models, `+`/`-` refresh interval (10 s to 10 min, default 60 s), `h` help.
+
+History is a by-product of readings the view already shows: each time it receives an account reading with a newer `fetched_ms` (from the daemon, or from its own cache-honouring probe in `--direct` mode) it appends one sample per window to `$XDG_STATE_HOME/atop/history` (default `~/.local/state/atop/history`; at most 240 samples per series, series unseen for 30 days are dropped). It never triggers a provider request. `--now-ms MS` freezes the clock for reproducible output.
 
 The daemon probes accounts in parallel (20 s ceiling per round; a slow or failing account gets its own error row), refreshes tokens through the same locked refresh path as `token`, and caches each account's reading: Anthropic for 5 minutes, others for 2 minutes, longer after errors or a `Retry-After`. Antigravity readings use the token agy keeps under `$XDG_DATA_HOME/omp/antigravity-cli`, matched by the account's Google email, and never refresh or rewrite it. The restricted socket cannot run `quota`.
 

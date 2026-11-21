@@ -1,0 +1,34 @@
+PROVIDER           ACCOUNT            WINDOW                      USED              RESETS  NOTE
+antigravity-acp    gemini             claude-opus-5-5               0%  ----------  5h00m
+                                      claude-sonnet-5-5             0%  ----------  5h00m
+                                      gemini-2.5-flash            100%  ##########  5d2h
+                                      gemini-2.5-flash-lite       100%  ##########  5d2h
+                                      gemini-2.5-flash-thinking   100%  ##########  5d2h
+                                      gemini-2.5-pro              100%  ##########  5d2h
+                                      gemini-3-flash              100%  ##########  5d2h
+                                      gemini-3.1-flash-image      100%  ##########  5d2h
+                                      gemini-3.1-flash-lite       100%  ##########  5d2h
+                                      gemini-3.5-flash-lite       100%  ##########  5d2h
+                                      gemini-3.8-flash            100%  ##########  5d2h
+                                      gemini-4-argon              100%  ##########  5d2h
+                                      gemini-4-carbon             100%  ##########  5d2h
+                                      gemini-4-hydrogen           100%  ##########  5d2h
+                                      gemini-4-hydrogen-sonar     100%  ##########  5d2h
+                                      gemini-4-neon               100%  ##########  5d2h
+                                      gpt-oss-120b                 12%  #---------  5h00m
+
+anthropic          personal           5h                           16%  ##--------  4h34m   max
+                                      7d                           64%  ######----  4d0h
+                                      7d Fable                      0%  ----------  4d0h
+
+anthropic          anthropic          5h                            0%  ----------
+                                      7d                           17%  ##--------  3d18h
+                                      7d Fable                      0%  ----------  3d18h
+
+anthropic          CU-enterprise      monthly                      65%  #######---          USD 1369.23/2100.00
+
+anthropic          beta               error                                                 HTTP 429 (rate limited), retry after 120s · 4m old
+
+openai-codex       openai-codex       spend                        73%  #######---  9d22h   business · 21801/30000 credits
+
+vercel-ai-gateway  vercel-ai-gateway  credits                                               balance $244.78 · used $41295.29

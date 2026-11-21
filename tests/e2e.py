@@ -3,13 +3,17 @@ import fcntl
 import http.server
 import json
 import os
+import pty
+import select
 import signal
 import socket
 import ssl
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 
@@ -1854,6 +1858,18 @@ def test_quota_and_atop(bin_path, tmp_dir):
         assert time.time() - dt0 < 3.5, "direct mode must not wait on an abandoned probe"
         assert {r["id"]: r for r in dq["accounts"]}["vercel-ai-gateway"]["status"] == "error"
         st["slow_vercel"] = False
+
+        tenv = dict(denv, TERM="xterm-256color", XDG_STATE_HOME=os.path.join(tmp_dir, "quota_xdg"))
+        tv = AtopPty(atop, ["--direct"], tenv, 120, 40)
+        ready = lambda s: "vercel" in s.text() and "fetching" not in s.text()
+        assert tv.pump(ready, timeout=20), tv.scr.text()
+        a0, b0 = st["hits"]["anthropic:tok-a"], st["hits"]["anthropic:tok-b"]
+        os.write(tv.master, b"r")
+        assert tv.pump(lambda s: st["hits"]["anthropic:tok-a"] > a0 and ready(s), timeout=20), "r must refetch in direct mode"
+        assert st["hits"]["anthropic:tok-b"] == b0, "direct-mode atop must keep Retry-After across refreshes"
+        os.write(tv.master, b"q")
+        tv.finish()
+        assert tv.proc.returncode == 0
         print("PASS quota op + atop table + parsers + retry-after cache + refresh lock + timeout isolation + restricted denial")
     finally:
         if proc.poll() is None:
@@ -1865,6 +1881,323 @@ def test_quota_and_atop(bin_path, tmp_dir):
                 proc.wait()
         srv.shutdown()
         srv.server_close()
+
+
+ATOP_NOW = 1795224400000
+ATOP_ALT_ON = "\x1b[?1049h"
+ATOP_ALT_OFF = "\x1b[?1049l"
+
+
+def atop_fake_quota():
+    n = ATOP_NOW
+    h, d = 3600000, 86400000
+    gem = [("claude-opus-5-5", 0, n + 5 * h), ("claude-sonnet-5-5", 0, n + 5 * h)]
+    for m in ("2.5-flash", "2.5-flash-lite", "2.5-flash-thinking", "2.5-pro", "3-flash", "3.1-flash-image",
+              "3.1-flash-lite", "3.5-flash-lite", "3.8-flash", "4-argon", "4-carbon", "4-hydrogen",
+              "4-hydrogen-sonar", "4-neon"):
+        gem.append(("gemini-" + m, 100, n + 5 * d + 2 * h))
+    gem.append(("gpt-oss-120b", 12, n + 5 * h))
+
+    def acct(i, prov, name, kind, wins, **extra):
+        row = {"id": i, "name": name, "provider": prov, "kind": kind,
+               "windows": [dict({"label": l, "used": u}, **({"resets_ms": r} if r else {})) for l, u, r in wins],
+               "status": "ok", "fetched_ms": n - 60000, "next_ms": n + 60000, "fails": 0}
+        row.update(extra)
+        return row
+
+    return {"v": 1, "ok": True, "now_ms": n, "accounts": [
+        acct("antigravity-acp:gemini", "antigravity-acp", "gemini", "acp", gem),
+        acct("anthropic:personal", "anthropic", "personal", "login",
+             [("5h", 16, n + 4 * h + 34 * 60000), ("7d", 64, n + 4 * d), ("7d Fable", 0, n + 4 * d)], plan="max"),
+        acct("anthropic:anthropic", "anthropic", "anthropic", "login",
+             [("5h", 0, 0), ("7d", 17, n + 3 * d + 18 * h), ("7d Fable", 0, n + 3 * d + 18 * h)]),
+        acct("anthropic:CU-enterprise", "anthropic", "CU-enterprise", "login", [("monthly", 65, 0)],
+             note="USD 1369.23/2100.00"),
+        {"id": "anthropic:beta", "name": "beta", "provider": "anthropic", "kind": "login", "status": "error",
+         "error": "HTTP 429 (rate limited), retry after 120s", "retry_after_s": 120, "windows": [],
+         "fetched_ms": n - 240000, "next_ms": n + 60000, "fails": 1},
+        acct("openai-codex", "openai-codex", "openai-codex", "oauth", [("spend", 73, n + 9 * d + 22 * h)],
+             note="21801/30000 credits", plan="business"),
+        dict(acct("vercel-ai-gateway", "vercel-ai-gateway", "vercel-ai-gateway", "api_key", []),
+             balance="244.78", total_used="41295.29"),
+    ]}
+
+
+def atop_seed_history(path):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    last = ATOP_NOW - 600000
+    series = {
+        ("anthropic:personal", "5h"): [min(100, (i * 7) % 60) for i in range(40)],
+        ("anthropic:personal", "7d"): [30 + i for i in range(34)],
+        ("anthropic:anthropic", "7d"): [5 + (i % 12) for i in range(50)],
+        ("anthropic:CU-enterprise", "monthly"): [40 + i // 2 for i in range(48)],
+        ("anthropic:CU-enterprise", "$left"): [126000 - i * 1100 for i in range(48)],
+        ("openai-codex", "spend"): [50 + i // 3 for i in range(66)],
+        ("vercel-ai-gateway", "$balance"): [30000 - i * 120 for i in range(46)],
+        ("antigravity-acp:gemini", "claude-opus-5-5"): [0] * 20 + [30, 60, 90, 100, 100, 0, 0],
+        ("antigravity-acp:gemini", "gpt-oss-120b"): [i % 20 for i in range(30)],
+    }
+    with open(path, "w") as f:
+        f.write("atop-history 1\n")
+        for (i, l), v in series.items():
+            f.write(f"{i}\t{l}\t{last}\t{','.join(map(str, v))}\n")
+
+
+def start_fake_quota_daemon(sock_path, payload):
+    state = {"quota": 0}
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(8)
+    body = payload if isinstance(payload, bytes) else (json.dumps(payload) + "\n").encode()
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            with c:
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                try:
+                    req = json.loads(buf.split(b"\n")[0] or b"{}")
+                except ValueError:
+                    req = {}
+                if req.get("op") == "quota":
+                    state["quota"] += 1
+                    c.sendall(body)
+                else:
+                    c.sendall(b'{"v":1,"ok":false,"error":"unsupported"}\n')
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, state
+
+
+class VtScreen:
+    def __init__(self, w, h):
+        self.raw = ""
+        self.snaps = []
+        self.resize(w, h)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+        self.grid = [[" "] * w for _ in range(h)]
+        self.x = self.y = 0
+
+    def put(self, ch):
+        if 0 <= self.y < self.h and 0 <= self.x < self.w:
+            self.grid[self.y][self.x] = ch
+        self.x += 1
+
+    def csi(self, params, final):
+        if final == "H":
+            parts = [int(p) if p.isdigit() else 1 for p in (params.split(";") if params else [])] + [1, 1]
+            self.y, self.x = parts[0] - 1, parts[1] - 1
+        elif final == "J" and params == "2":
+            self.grid = [[" "] * self.w for _ in range(self.h)]
+        elif final in "hl" and params == "?1049":
+            if final == "l":
+                self.snaps.append(self.text())
+            self.grid = [[" "] * self.w for _ in range(self.h)]
+
+    def feed(self, data):
+        self.raw += data
+        i = 0
+        while i < len(data):
+            c = data[i]
+            if c == "\x1b" and i + 1 < len(data) and data[i + 1] == "[":
+                j = i + 2
+                while j < len(data) and not ("\x40" <= data[j] <= "\x7e"):
+                    j += 1
+                if j >= len(data):
+                    break
+                self.csi(data[i + 2:j], data[j])
+                i = j + 1
+                continue
+            if c == "\x1b":
+                i += 2
+                continue
+            if c == "\r":
+                self.x = 0
+            elif c == "\n":
+                self.y += 1
+            elif c >= " ":
+                self.put(c)
+            i += 1
+
+    def text(self):
+        return "\n".join("".join(r).rstrip() for r in self.grid) + "\n"
+
+
+class AtopPty:
+    def __init__(self, atop, args, env, w, h):
+        self.master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", h, w, 0, 0))
+        self.proc = subprocess.Popen([atop] + args, stdin=slave, stdout=slave, stderr=slave, env=env,
+                                     close_fds=True, start_new_session=True)
+        os.close(slave)
+        self.scr = VtScreen(w, h)
+        self.dec = __import__("codecs").getincrementaldecoder("utf-8")("replace")
+        self.pending = ""
+
+    def pump(self, pred, timeout=10.0, quiet=0.4):
+        end = time.time() + timeout
+        last = time.time()
+        while time.time() < end:
+            r, _, _ = select.select([self.master], [], [], 0.05)
+            if r:
+                try:
+                    data = os.read(self.master, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    return pred(self.scr)
+                self.pending += self.dec.decode(data)
+                cut = self.pending.rfind("\x1b")
+                tail = ""
+                if cut >= 0 and not any("\x40" <= ch <= "\x7e" for ch in self.pending[cut + 2:]):
+                    self.pending, tail = self.pending[:cut], self.pending[cut:]
+                self.scr.feed(self.pending)
+                self.pending = tail
+                last = time.time()
+            elif pred(self.scr) and time.time() - last >= quiet:
+                return True
+        return pred(self.scr)
+
+    def key(self, k, pred, what):
+        os.write(self.master, k.encode())
+        assert self.pump(pred), f"atop did not react to {k!r}: {what}\n{self.scr.text()}"
+
+    def resize(self, w, h):
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", h, w, 0, 0))
+        self.scr.resize(w, h)
+        os.kill(self.proc.pid, signal.SIGWINCH)
+
+    def finish(self, timeout=5):
+        self.proc.wait(timeout=timeout)
+        self.pump(lambda s: True, timeout=0.3, quiet=0.1)
+        attrs = termios.tcgetattr(self.master)
+        os.close(self.master)
+        return attrs
+
+
+def atop_golden(name, text):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    out_dir = os.environ.get("ATOP_GOLDEN_OUT")
+    if out_dir:
+        with open(os.path.join(out_dir, name), "w") as f:
+            f.write(text)
+        return
+    with open(path) as f:
+        want = f.read()
+    if want != text:
+        import difflib
+        diff = "".join(difflib.unified_diff(want.splitlines(True), text.splitlines(True), "golden/" + name, "got"))
+        raise AssertionError(f"atop snapshot {name} differs:\n{diff}")
+
+
+def test_atop_tty(bin_path, tmp_dir):
+    atop = os.path.join(os.path.dirname(bin_path), "atop")
+    sock = os.path.join(tmp_dir, "atop-fake.sock")
+    payload = atop_fake_quota()
+    srv, st = start_fake_quota_daemon(sock, payload)
+    xdg = os.path.join(tmp_dir, "atop-xdg")
+    hist = os.path.join(xdg, "atop", "history")
+    atop_seed_history(hist)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TERM": "xterm-256color", "TZ": "UTC",
+           "XDG_STATE_HOME": xdg, "LANG": "C.UTF-8"}
+    args = ["--socket", sock, "--now-ms", str(ATOP_NOW)]
+    try:
+        piped = run_cmd(atop, args, env=env).stdout
+        atop_golden("atop-piped.txt", piped)
+        assert "\x1b" not in piped
+        with open(hist) as f:
+            seeded = f.read()
+        assert st["quota"] == 1
+
+        has_data = lambda s: "vercel" in s.text() and "fetching" not in s.text()
+        t = AtopPty(atop, args, env, 80, 24)
+        assert t.pump(has_data), "atop never drew data at 80x24:\n" + t.scr.text()
+        assert t.scr.raw.startswith(ATOP_ALT_ON), repr(t.scr.raw[:40])
+        atop_golden("atop-80x24.txt", t.scr.text())
+        before = len(t.scr.raw)
+        t.pump(lambda s: True, timeout=1.5, quiet=1.2)
+        assert len(t.scr.raw) == before, f"idle frame repainted: {t.scr.raw[before:]!r}"
+        t.resize(200, 50)
+        assert t.pump(has_data), "atop never redrew at 200x50:\n" + t.scr.text()
+        atop_golden("atop-200x50.txt", t.scr.text())
+        t.key("e", lambda s: "gemini-4-neon" in s.text(), "expand exhausted")
+        t.key("e", lambda s: "gemini-4-neon" not in s.text() and "14 exhausted" in s.text(), "collapse")
+        t.key("1", lambda s: "antigravity" not in s.text() and "hidden" in s.text(), "hide panel 1")
+        t.key("1", lambda s: "antigravity" in s.text() and "hidden" not in s.text(), "show panel 1")
+        t.key("h", lambda s: "refresh interval" in s.text(), "help")
+        t.key("h", lambda s: "refresh interval" not in s.text(), "close help")
+        t.key("+", lambda s: " 2m " in s.text().splitlines()[0], "slower refresh")
+        t.key("r", lambda s: st["quota"] == 3, "refresh now")
+        t.key("q", lambda s: True, "quit")
+        attrs = t.finish()
+        assert t.proc.returncode == 0, t.proc.returncode
+        assert t.scr.raw.endswith(ATOP_ALT_OFF), repr(t.scr.raw[-40:])
+        assert attrs[3] & termios.ECHO and attrs[3] & termios.ICANON, "terminal modes not restored"
+        assert ";38;5;" in t.scr.raw and ";38;2;" not in t.scr.raw
+        for ch in ("\u256d", "\u2570", "\u25a0", "\u00b9", "\u2074"):
+            assert ch in t.scr.raw, f"missing {ch!r}"
+        assert any(0x2801 <= ord(ch) <= 0x28ff for ch in t.scr.raw), "no braille sparkline drawn"
+
+        with open(hist) as f:
+            recorded = f.read()
+        assert len(recorded) < 16384 and recorded.startswith("atop-history 1\n"), len(recorded)
+        rows = {tuple(l.split("\t")[:2]): l.split("\t") for l in recorded.splitlines()[1:]}
+        assert rows[("anthropic:personal", "5h")][2] == str(ATOP_NOW - 60000)
+        assert rows[("anthropic:personal", "5h")][3].endswith(",16") and rows[("anthropic:personal", "5h")][3].count(",") == 40
+        assert rows[("vercel-ai-gateway", "$balance")][3].endswith(",24478")
+        assert rows[("anthropic:anthropic", "5h")][3] == "0"
+        assert ("anthropic:beta", "5h") not in rows
+        assert recorded != seeded
+
+        nc = dict(env, NO_COLOR="1", COLORTERM="truecolor")
+        t2 = AtopPty(atop, args, nc, 80, 24)
+        assert t2.pump(has_data), t2.scr.text()
+        os.kill(t2.proc.pid, signal.SIGTERM)
+        attrs = t2.finish()
+        assert t2.proc.returncode == -signal.SIGTERM, t2.proc.returncode
+        assert t2.scr.raw.endswith(ATOP_ALT_OFF), repr(t2.scr.raw[-40:])
+        assert attrs[3] & termios.ECHO, "SIGTERM left the terminal raw"
+        assert ";38;" not in t2.scr.raw, "NO_COLOR output carried colour"
+        assert "\u25a0\u00b7\u00b7" in t2.scr.snaps[-1] and "\x1b[0;1" in t2.scr.raw and "\x1b[0;2" in t2.scr.raw
+        with open(hist) as f:
+            assert f.read() == recorded, "re-reading the same daemon reading must not add samples"
+        assert st["quota"] == 4, st
+
+        evil = atop_fake_quota()
+        evil["accounts"][2]["windows"][1]["label"] = "EVIL\u001b]52;c;aGk=\u0007\u001b[2J\u2705\u064b@@OVERLONG@@\u4e2dX"
+        evil["accounts"][2]["name"] = "anthr\u0301opic"
+        raw = (json.dumps(evil, ensure_ascii=False) + "\n").encode().replace(b"@@OVERLONG@@", b"\xc1\x9b[2J\xe0\x80\x9b")
+        esock = os.path.join(tmp_dir, "atop-evil.sock")
+        esrv, _ = start_fake_quota_daemon(esock, raw)
+        try:
+            t3 = AtopPty(atop, ["--socket", esock, "--now-ms", str(ATOP_NOW)], env, 80, 24)
+            assert t3.pump(lambda s: "EVIL" in s.text() and "fetching" not in s.text()), t3.scr.text()
+            screen = t3.scr.text()
+            os.write(t3.master, b"q")
+            t3.finish()
+            body = t3.scr.raw.replace("\x1b[0m\x1b[H\x1b[2J", "")
+            assert "\x1b]" not in body and "\x07" not in body and "\x1b[2J" not in body, "provider text reached the terminal as escapes"
+            row = next(l for l in screen.splitlines() if "EVIL" in l)
+            assert "\u2705" not in screen and "\u4e2d" not in screen and "\u0301" not in screen, row
+            for l in screen.splitlines():
+                assert len(l) <= 80, l
+                if l.startswith("\u2502"):
+                    assert l[39] == "\u2502" or len(l) <= 40, f"box border shifted: {l!r}"
+        finally:
+            esrv.close()
+        print("PASS atop tty: 80x24 + 200x50 snapshots, SIGWINCH, keys, history, NO_COLOR, terminal restore, hostile text")
+    finally:
+        srv.close()
 
 
 def main():
@@ -1893,6 +2226,7 @@ def main():
         test_forked_tls13_children(bin_path, tmp)
         test_sha1_root_ca_chain(bin_path, tmp)
         test_quota_and_atop(bin_path, tmp)
+        test_atop_tty(bin_path, tmp)
     print("ALL E2E PASSED")
 
 
