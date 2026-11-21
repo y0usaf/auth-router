@@ -2130,6 +2130,8 @@ def test_atop_tty(bin_path, tmp_dir):
         t.resize(200, 50)
         assert t.pump(has_data), "atop never redrew at 200x50:\n" + t.scr.text()
         atop_golden("atop-200x50.txt", t.scr.text())
+        t.key("v", lambda s: "cols" in s.text().splitlines()[0] and "╮╭" in s.text(), "toggle multi-column")
+        t.key("v", lambda s: "cols" not in s.text().splitlines()[0] and "╮╭" not in s.text(), "toggle vertical")
         t.key("e", lambda s: "gemini-2.5-pro" in s.text() and "gemini-4-neon +13" not in s.text(), "expand pools")
         t.key("e", lambda s: "gemini-2.5-pro" not in s.text() and "gemini-4-neon +13" in s.text(), "collapse pools")
         t.key("1", lambda s: "gemini-4-neon" not in s.text() and "claude-opus-5-5" in s.text() and "hidden" in s.text(), "hide panel 1")
@@ -2192,7 +2194,7 @@ def test_atop_tty(bin_path, tmp_dir):
             for l in screen.splitlines():
                 assert len(l) <= 80, l
                 if l.startswith("\u2502"):
-                    assert l[39] == "\u2502" or len(l) <= 40, f"box border shifted: {l!r}"
+                    assert len(l) == 80 and l[79] == "\u2502", f"box border shifted: {l!r}"
         finally:
             esrv.close()
         print("PASS atop tty: 80x24 + 200x50 snapshots, SIGWINCH, keys, history, NO_COLOR, terminal restore, hostile text")

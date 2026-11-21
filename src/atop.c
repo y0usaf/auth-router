@@ -114,8 +114,19 @@ typedef struct {
     int y;
     int w;
     int h;
+    int col;
     bool shown;
+    bool joined_top;
+    bool joined_bottom;
 } box_t;
+
+typedef struct {
+    int lw;
+    int vw;
+    int rw;
+    int mw;
+    int sw;
+} col_metrics_t;
 
 typedef struct {
     char id[96];
@@ -1055,18 +1066,21 @@ static void draw_meter(int x, int y, int w, double frac, bool pct, uint32_t hue)
     }
 }
 
-static void draw_frame(int x, int y, int w, int h, uint32_t bc) {
-    put_cp(x, y, 0x256d, bc, 0);
+static void draw_frame(int x, int y, int w, int h, uint32_t bc, bool jtop, bool jbot) {
+    put_cp(x, y, jtop ? 0x251c : 0x256d, bc, 0);
     hline(x + 1, y, w - 2, 0x2500, bc);
-    put_cp(x + w - 1, y, 0x256e, bc, 0);
-    for (int r = 1; r < h - 1; r++) {
+    put_cp(x + w - 1, y, jtop ? 0x2524 : 0x256e, bc, 0);
+    int inner_end = jbot ? h : h - 1;
+    for (int r = 1; r < inner_end; r++) {
         put_cp(x, y + r, 0x2502, bc, 0);
         put_cp(x + w - 1, y + r, 0x2502, bc, 0);
         hline(x + 1, y + r, w - 2, ' ', 0);
     }
-    put_cp(x, y + h - 1, 0x2570, bc, 0);
-    hline(x + 1, y + h - 1, w - 2, 0x2500, bc);
-    put_cp(x + w - 1, y + h - 1, 0x256f, bc, 0);
+    if (!jbot) {
+        put_cp(x, y + h - 1, 0x2570, bc, 0);
+        hline(x + 1, y + h - 1, w - 2, 0x2500, bc);
+        put_cp(x + w - 1, y + h - 1, 0x256f, bc, 0);
+    }
 }
 
 static int tag(int x, int y, int maxw, const char *hot, const char *text, uint32_t bc, uint32_t fg) {
@@ -1089,36 +1103,25 @@ static int box_lines(const box_t *b, int g) {
     return n;
 }
 
-static void draw_box(const box_t *b, bool expanded, int g) {
-    int x0 = b->x, y0 = b->y, w = b->w, h = b->h;
-    draw_frame(x0, y0, w, h, b->hue);
-    const char *sup = b->panel >= 0 && b->panel < 4 ? SUPER[b->panel] : "";
-    int room = w - 4;
-    int tl = ulen(b->title);
-    int il = b->info[0] ? ulen(b->info) + 2 : 0;
-    if (il && 2 + 1 + tl + 1 + il > room) il = 0;
-    int maxt = (il ? room - il - 1 : room) - 2 - ulen(sup);
-    if (maxt >= 3) {
-        put_cp(x0 + 2, y0, 0x2510, b->hue, 0);
-        int k = 1 + put_str(x0 + 3, y0, sup, 4, C_HOT, A_BOLD);
-        k += put_str(x0 + 2 + k, y0, b->title, maxt, C_TITLE, A_BOLD);
-        put_cp(x0 + 2 + k, y0, 0x250c, b->hue, 0);
-    }
-    if (il) tag(x0 + w - 2 - il, y0, il, "", b->info, b->hue, b->err ? C_ERR : C_DIM);
-    int iw = w - 4, ix = x0 + 2;
-    int lw = 0, vw = 4, rw = 0;
+static void scan_box_widths(const box_t *b, int *lw, int *vw, int *rw) {
     for (int i = 0; i < b->rn; i++) {
         const row_t *r = &g_rows[b->r0 + i];
         if (r->kind == R_TEXT) continue;
-        if (ulen(r->label) > lw) lw = ulen(r->label);
-        if (ulen(r->value) > vw) vw = ulen(r->value);
-        if (ulen(r->right) > rw) rw = ulen(r->right);
+        if (ulen(r->label) > *lw) *lw = ulen(r->label);
+        if (ulen(r->value) > *vw) *vw = ulen(r->value);
+        if (ulen(r->right) > *rw) *rw = ulen(r->right);
     }
+}
+
+static col_metrics_t compute_metrics(int w, int g, int lw, int vw, int rw) {
+    int iw = w - 4;
+    if (vw < 4) vw = 4;
     if (vw > iw / 4 && vw > 4) vw = iw / 4 > 4 ? iw / 4 : 4;
     if (rw > iw / 3) rw = iw / 3;
     bool tall = g > 1;
     if (tall) rw = 0;
     int lcap = iw / 3 > 6 ? iw / 3 : 6;
+    if (lcap > 28) lcap = 28;
     if (lw > lcap) lw = lcap;
     int rest = iw - lw - 1 - vw - (rw ? rw + 1 : 0) - 1;
     if (rest < 6 && rw) {
@@ -1133,16 +1136,56 @@ static void draw_box(const box_t *b, bool expanded, int g) {
     if (rest < 1) rest = 1;
     int sw = 0, mw = rest;
     if (rest >= 12) {
-        sw = clampi(rest * 2 / 5, 4, 120);
+        sw = clampi(rest * 2 / 5, 4, HIST_CAP / 2);
         mw = rest - sw - 1;
-        if (mw > 40) {
-            sw = clampi(sw + mw - 40, 4, 120);
-            mw = 40;
+        if (mw > 52) {
+            int add = mw - 52;
+            if (sw + add > HIST_CAP / 2) add = HIST_CAP / 2 - sw;
+            sw += add;
+            mw = rest - sw - 1;
         }
     }
-    int bottom = y0 + h - 1;
-    bool cut = !tall && h - 2 < b->rn;
-    int shown = cut ? h - 3 : b->rn;
+    col_metrics_t m = {lw, vw, rw, mw, sw};
+    return m;
+}
+
+static void draw_box(const box_t *b, bool expanded, int g, const col_metrics_t *shared) {
+    int x0 = b->x, y0 = b->y, w = b->w, h = b->h;
+    draw_frame(x0, y0, w, h, b->hue, b->joined_top, b->joined_bottom);
+    const char *sup = b->panel >= 0 && b->panel < 4 ? SUPER[b->panel] : "";
+    int suplen = ulen(sup);
+    int room = w - 4;
+    int tl = ulen(b->title);
+    int il = b->info[0] ? ulen(b->info) + 2 : 0;
+    if (il && 2 + suplen + tl + 1 + il > room) il = 0;
+    const char *elabel = expanded ? " collapse" : " expand";
+    int el = (b->collapsible && b->joined_bottom) ? (2 + 1 + ulen(elabel)) : 0;
+    if (el && 2 + suplen + tl + 1 + il + (il ? 1 : 0) + el > room) el = 0;
+    int rused = il + (il && el ? 1 : 0) + el;
+    int maxt = (rused ? room - rused - 1 : room) - 2 - suplen;
+    if (maxt >= 3) {
+        put_cp(x0 + 2, y0, 0x2510, b->hue, 0);
+        int k = 1 + put_str(x0 + 3, y0, sup, 4, C_HOT, A_BOLD);
+        k += put_str(x0 + 2 + k, y0, b->title, maxt, C_TITLE, A_BOLD);
+        put_cp(x0 + 2 + k, y0, 0x250c, b->hue, 0);
+    }
+    if (il) tag(x0 + w - 2 - il, y0, il, "", b->info, b->hue, b->err ? C_ERR : C_DIM);
+    if (el) tag(x0 + w - 2 - rused, y0, el, "e", elabel, b->hue, C_DIM);
+    int iw = w - 4, ix = x0 + 2;
+    col_metrics_t m;
+    if (shared) {
+        m = *shared;
+    } else {
+        int lw = 0, vw = 4, rw = 0;
+        scan_box_widths(b, &lw, &vw, &rw);
+        m = compute_metrics(w, g, lw, vw, rw);
+    }
+    int lw = m.lw, vw = m.vw, rw = m.rw, mw = m.mw, sw = m.sw;
+    bool tall = g > 1;
+    int inner_h = h - (b->joined_bottom ? 1 : 2);
+    int bottom = y0 + 1 + inner_h;
+    bool cut = !tall && inner_h < b->rn;
+    int shown = cut ? inner_h - 1 : b->rn;
     int y = y0 + 1;
     for (int i = 0; i < shown; i++) {
         const row_t *r = &g_rows[b->r0 + i];
@@ -1168,12 +1211,12 @@ static void draw_box(const box_t *b, bool expanded, int g) {
         if (rw) put_rpad(ix + iw - rw, y, r->right, rw, C_DIM, 0);
         y += rl;
     }
-    if (cut && h >= 3) {
+    if (cut && inner_h >= 1) {
         char more[32];
         snprintf(more, sizeof(more), "+%d more", b->rn - shown);
-        put_str(ix, y0 + h - 2, more, iw, C_DIM, 0);
+        put_str(ix, bottom - 1, more, iw, C_DIM, 0);
     }
-    if (b->collapsible) tag(x0 + 2, y0 + h - 1, w - 4, "e", expanded ? " collapse" : " expand", b->hue, C_DIM);
+    if (b->collapsible && !b->joined_bottom) tag(x0 + 2, y0 + h - 1, w - 4, "e", elabel, b->hue, C_DIM);
 }
 
 static int part_cols(const int *hs, int n, int k, int *cut) {
@@ -1205,24 +1248,36 @@ static int part_cols(const int *hs, int n, int k, int *cut) {
     return best[k][n];
 }
 
-static int layout(int W, int H, unsigned hidden, int *g_out) {
+static int layout(int W, int H, unsigned hidden, bool cols, int *scroll_io, int *g_out, int *k_out) {
     int idx[MAX_BOXES], hs[MAX_BOXES], n = 0;
     *g_out = 1;
+    *k_out = 1;
     for (int i = 0; i < g_nboxes; i++) {
         g_boxes[i].shown = false;
+        g_boxes[i].joined_top = false;
+        g_boxes[i].joined_bottom = false;
+        g_boxes[i].col = 0;
         if (hidden & (1u << g_boxes[i].panel)) continue;
         g_boxes[i].vis = g_boxes[i].rn;
         idx[n] = i;
         hs[n++] = g_boxes[i].rn + 2;
     }
-    if (!n) return 0;
+    if (!n) {
+        *scroll_io = 0;
+        return 0;
+    }
     int AH = H - 1;
-    int maxk = clampi(W / MIN_BOX_W, 1, n);
-    int k = clampi((W + WIDE_BOX_W - 1) / WIDE_BOX_W, 1, maxk);
     int cut[MAX_BOXES + 1];
-    while (part_cols(hs, n, k, cut) > AH && k < maxk) k++;
-    int tightk = clampi(W / TIGHT_BOX_W, 1, n);
-    while (part_cols(hs, n, k, cut) > AH && k < tightk) k++;
+    int k = 1;
+    if (cols) {
+        int maxk = clampi(W / MIN_BOX_W, 1, n);
+        int wantk = (W + WIDE_BOX_W - 1) / WIDE_BOX_W;
+        if (wantk < 2) wantk = 2;
+        k = clampi(wantk, 1, maxk);
+        while (part_cols(hs, n, k, cut) > AH && k < maxk) k++;
+        int tightk = clampi(W / TIGHT_BOX_W, 1, n);
+        while (part_cols(hs, n, k, cut) > AH && k < tightk) k++;
+    }
     int g = 1;
     for (int t = GRAPH_MAX; t >= 2; t--) {
         int ht[MAX_BOXES];
@@ -1235,14 +1290,31 @@ static int layout(int W, int H, unsigned hidden, int *g_out) {
     }
     part_cols(hs, n, k, cut);
     *g_out = g;
+    *k_out = k;
+    if (k > 1) *scroll_io = 0;
     int off = 0;
     for (int c = 0; c < k; c++) {
         int cw = W / k + (c < W % k ? 1 : 0);
+        int a = cut[c], b_end = cut[c + 1];
+        int cn = b_end - a;
+        if (cn <= 0) {
+            off += cw;
+            continue;
+        }
         int total = 0;
-        for (int j = cut[c]; j < cut[c + 1]; j++) total += hs[j];
+        for (int j = a; j < b_end; j++) total += hs[j];
+        bool compact = g == 1 && cn > 1 && total > AH;
+        if (compact) {
+            total = 1;
+            for (int j = a; j < b_end; j++) {
+                hs[j] = g_boxes[idx[j]].vis + 1;
+                total += hs[j];
+            }
+            hs[b_end - 1]++;
+        }
         while (g == 1 && total > AH) {
             int big = -1;
-            for (int j = cut[c]; j < cut[c + 1]; j++) {
+            for (int j = a; j < b_end; j++) {
                 box_t *b = &g_boxes[idx[j]];
                 if (b->vis > 2 && (big < 0 || b->vis > g_boxes[idx[big]].vis)) big = j;
             }
@@ -1251,15 +1323,50 @@ static int layout(int W, int H, unsigned hidden, int *g_out) {
             hs[big]--;
             total--;
         }
+        int start = a;
+        if (k == 1) {
+            if (total <= AH) {
+                *scroll_io = 0;
+            } else {
+                int max_sc = 0;
+                int tail = 0;
+                for (int j = b_end - 1; j >= a; j--) {
+                    int need = compact ? g_boxes[idx[j]].vis + (j == b_end - 1 ? 2 : 1) : hs[j];
+                    if (tail + need > AH) {
+                        max_sc = j + 1 - a;
+                        break;
+                    }
+                    tail += need;
+                }
+                if (max_sc > cn - 1) max_sc = cn - 1;
+                *scroll_io = clampi(*scroll_io, 0, max_sc);
+                start = a + *scroll_io;
+            }
+        }
         int y = 1;
-        for (int j = cut[c]; j < cut[c + 1]; j++) {
+        int first_shown = -1, last_shown = -1;
+        for (int j = start; j < b_end; j++) {
             box_t *b = &g_boxes[idx[j]];
+            int bh = compact ? b->vis + 1 : hs[j];
+            int need_end = compact ? bh + 1 : bh;
+            if (y + need_end > H) break;
             b->x = off;
             b->w = cw;
             b->y = y;
-            b->h = hs[j];
-            b->shown = y + b->h <= H;
-            if (b->shown) y += b->h;
+            b->h = bh;
+            b->col = c;
+            b->shown = true;
+            if (first_shown < 0) first_shown = j;
+            last_shown = j;
+            y += bh;
+        }
+        if (compact && first_shown >= 0) {
+            for (int j = first_shown; j <= last_shown; j++) {
+                box_t *b = &g_boxes[idx[j]];
+                b->joined_top = j > first_shown;
+                b->joined_bottom = j < last_shown;
+            }
+            g_boxes[idx[last_shown]].h++;
         }
         off += cw;
     }
@@ -1281,6 +1388,8 @@ typedef struct {
     int step;
     unsigned hidden;
     bool expanded;
+    bool cols;
+    int scroll;
     bool help;
 } ui_t;
 
@@ -1294,7 +1403,7 @@ static int hot_word(int x, int y, const char *hot, const char *rest) {
     return k + put_str(x + k, y, rest, 40, C_DIM, 0);
 }
 
-static void draw_header(const ui_t *u, int dropped) {
+static void draw_header(const ui_t *u, int dropped, bool cols_active) {
     time_t t = (time_t)(clock_ms() / 1000);
     struct tm tmv;
     char clock[16] = "";
@@ -1306,9 +1415,21 @@ static void draw_header(const ui_t *u, int dropped) {
     if (secs < 120) snprintf(iv, sizeof(iv), " %ds ", secs);
     else snprintf(iv, sizeof(iv), " %dm ", secs / 60);
     int rw = 1 + ulen(iv) + 1 + 2 + 7 + 2 + 4 + 1;
-    bool full_right = g_w - (cx + cl) - 2 >= rw;
+    int vw = rw + 6;
+    int rroom = g_w - (cx + cl) - 2;
     int x = g_w - 1;
-    if (full_right) {
+    if (rroom >= vw) {
+        x -= vw - 1;
+        x += hot_word(x, 0, "v", "iew");
+        x += 2;
+        x += hot_word(x, 0, "r", "efresh");
+        x += 2;
+        x += put_str(x, 0, "-", 1, C_HOT, A_BOLD);
+        x += put_str(x, 0, iv, 8, C_TEXT, 0);
+        x += put_str(x, 0, "+", 1, C_HOT, A_BOLD);
+        x += 2;
+        hot_word(x, 0, "h", "elp");
+    } else if (rroom >= rw) {
         x -= rw - 1;
         x += hot_word(x, 0, "r", "efresh");
         x += 2;
@@ -1317,7 +1438,7 @@ static void draw_header(const ui_t *u, int dropped) {
         x += put_str(x, 0, "+", 1, C_HOT, A_BOLD);
         x += 2;
         hot_word(x, 0, "h", "elp");
-    } else if (g_w - (cx + cl) - 2 >= 6) {
+    } else if (rroom >= 6) {
         hot_word(g_w - 5, 0, "h", "elp");
     }
     put_str(cx, 0, clock, cl, C_TITLE, A_BOLD);
@@ -1330,6 +1451,11 @@ static void draw_header(const ui_t *u, int dropped) {
         sfg = C_ERR;
     } else if (u->child > 0) {
         snprintf(st, sizeof(st), "fetching\xe2\x80\xa6");
+    }
+    if (cols_active && lroom >= 6) {
+        int k = put_str(lx, 0, "cols", lroom, C_DIM, 0);
+        lx += k + 2;
+        lroom -= k + 2;
     }
     char hid[64] = "";
     for (int p = 0; p < g_npanels; p++) {
@@ -1355,9 +1481,11 @@ static void draw_help(void) {
     static const char *const K[][2] = {
         {"q", "quit"},
         {"r", "refresh now (daemon still rate-limits)"},
+        {"v", "toggle vertical / columns layout"},
         {"1-4", "show or hide a panel"},
         {"e", "expand or collapse shared quota pools"},
         {"+ -", "refresh interval"},
+        {"j k", "scroll when boxes overflow"},
         {"h", "close help"},
     };
     int n = (int)(sizeof(K) / sizeof(K[0]));
@@ -1365,7 +1493,7 @@ static void draw_help(void) {
     int h = n + 4;
     if (h > g_h - 1) h = g_h - 1;
     int x = (g_w - w) / 2, y = 1 + (g_h - 1 - h) / 2;
-    draw_frame(x, y, w, h, C_HOT);
+    draw_frame(x, y, w, h, C_HOT, false, false);
     tag(x + 2, y, w - 4, "", "help", C_HOT, C_TITLE);
     for (int i = 0; i < n && 2 + i < h - 1; i++) {
         put_str(x + 3, y + 2 + i, K[i][0], 5, C_HOT, A_BOLD);
@@ -1373,7 +1501,7 @@ static void draw_help(void) {
     }
 }
 
-static void draw_screen(const ui_t *u) {
+static void draw_screen(ui_t *u) {
     grid_clear();
     if (g_w < MIN_W || g_h < MIN_H) {
         char m[64];
@@ -1385,13 +1513,36 @@ static void draw_screen(const ui_t *u) {
         }
         return;
     }
-    int dropped = 0;
+    int dropped = 0, k = 1;
     if (u->resp) {
         build_model(u->resp, clock_ms(), u->expanded);
         int g = 1;
-        dropped = layout(g_w, g_h, u->hidden, &g);
+        dropped = layout(g_w, g_h, u->hidden, u->cols, &u->scroll, &g, &k);
+        col_metrics_t cm[MAX_BOXES];
+        bool has_cm[MAX_BOXES];
+        for (int c = 0; c < k; c++) {
+            has_cm[c] = false;
+            int cw = 0, lw = 0, vw = 4, rw = 0;
+            for (int i = 0; i < g_nboxes; i++) {
+                if (k == 1) {
+                    if (u->hidden & (1u << g_boxes[i].panel)) continue;
+                    cw = g_w;
+                } else {
+                    if (!g_boxes[i].shown || g_boxes[i].col != c) continue;
+                    cw = g_boxes[i].w;
+                }
+                scan_box_widths(&g_boxes[i], &lw, &vw, &rw);
+            }
+            if (cw >= 64) {
+                cm[c] = compute_metrics(cw, g, lw, vw, rw);
+                has_cm[c] = true;
+            }
+        }
         for (int i = 0; i < g_nboxes; i++) {
-            if (g_boxes[i].shown) draw_box(&g_boxes[i], u->expanded, g);
+            if (g_boxes[i].shown) {
+                int c = g_boxes[i].col;
+                draw_box(&g_boxes[i], u->expanded, g, has_cm[c] ? &cm[c] : NULL);
+            }
         }
         if (!g_nboxes) draw_center(g_h / 2, "no accounts", C_DIM);
         else if (u->hidden && dropped == 0) {
@@ -1402,7 +1553,7 @@ static void draw_screen(const ui_t *u) {
     } else {
         draw_center(g_h / 2, u->err[0] ? u->err : "fetching quota\xe2\x80\xa6", u->err[0] ? C_ERR : C_DIM);
     }
-    draw_header(u, dropped);
+    draw_header(u, dropped, k > 1);
     if (u->help) draw_help();
 }
 
@@ -1617,8 +1768,13 @@ static bool handle_keys(ui_t *u, const char *buf, ssize_t n) {
         char c = buf[i];
         if (c == 27) {
             if (i + 1 < n && (buf[i + 1] == '[' || buf[i + 1] == 'O')) {
-                i += 2;
-                while (i < n && !((unsigned char)buf[i] >= 0x40 && (unsigned char)buf[i] <= 0x7e)) i++;
+                ssize_t j = i + 2;
+                while (j < n && !((unsigned char)buf[j] >= 0x40 && (unsigned char)buf[j] <= 0x7e)) j++;
+                if (j == i + 2 && j < n) {
+                    if (buf[j] == 'B') u->scroll++;
+                    else if (buf[j] == 'A' && u->scroll > 0) u->scroll--;
+                }
+                i = j;
             } else {
                 u->help = false;
             }
@@ -1632,6 +1788,19 @@ static bool handle_keys(ui_t *u, const char *buf, ssize_t n) {
         case 'r':
         case 'R':
             if (u->child < 0) u->next_fetch = 0;
+            break;
+        case 'v':
+        case 'V':
+            u->cols = !u->cols;
+            u->scroll = 0;
+            break;
+        case 'j':
+        case 'J':
+            u->scroll++;
+            break;
+        case 'k':
+        case 'K':
+            if (u->scroll > 0) u->scroll--;
             break;
         case '1':
         case '2':
