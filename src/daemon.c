@@ -1219,6 +1219,7 @@ static void finish_refresh_job(refresh_job_t *job,
                 j_obj_set(res, "provider", j_str(w->pres.provider));
                 j_obj_set(res, "model", j_str(w->pres.model));
                 j_obj_set(res, "login_id", j_str(w->pres.selected_id));
+                j_obj_set(res, "login", j_str(w->pres.selected_id));
                 j_obj_set(res, "kind", j_str(w->cred.kind));
                 j_obj_set(res, "credential_id", j_str(w->cred.id));
                 j_obj_set(res, "access", j_str(access));
