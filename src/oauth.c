@@ -28,8 +28,14 @@ void oa_tok_free(oa_tok_t *t) {
 
 static const char *KNOWN_IDS[] = {
     "openai-codex", "xai", "kimi-coding", "github-copilot", "openrouter", "meta",
-    "qwen-oauth", "nous", "minimax", "openai", "google-gemini-cli", "google-antigravity", NULL
+    "qwen-oauth", "nous", "minimax", "openai", "google-gemini-cli", "google-antigravity", "cursor", NULL
 };
+
+#define CURSOR_CLIENT_ID "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
+#define CURSOR_POLL_MAX_ATTEMPTS 150
+#define CURSOR_POLL_BASE_MS 1000
+#define CURSOR_POLL_MAX_MS 10000
+#define CURSOR_POLL_MAX_ERRORS 3
 
 static const char *DEVICE_IDS[] = {
     "xai", "kimi-coding", "github-copilot", "meta", "qwen-oauth", "nous", "minimax", NULL
@@ -46,6 +52,7 @@ const char *oa_flow_kind(const char *id) {
     for (int i = 0; DEVICE_IDS[i]; i++) {
         if (strcmp(DEVICE_IDS[i], id) == 0) return "device";
     }
+    if (strcmp(id, "cursor") == 0) return "poll";
     return "";
 }
 
@@ -529,6 +536,7 @@ static const char *token_url_for(const char *provider) {
     if (strcmp(provider, "openai-codex") == 0) return env_or("CODEX_OAUTH_TOKEN_URL", "https://auth.openai.com/oauth/token");
     if (strcmp(provider, "google-gemini-cli") == 0 || strcmp(provider, "google-antigravity") == 0)
         return env_or("GOOGLE_OAUTH_TOKEN_URL", "https://oauth2.googleapis.com/token");
+    if (strcmp(provider, "cursor") == 0) return env_or("CURSOR_OAUTH_TOKEN_URL", "https://api2.cursor.sh/oauth/token");
     return "";
 }
 
@@ -538,7 +546,53 @@ static const char *client_id_for(const char *provider) {
     if (strcmp(provider, "github-copilot") == 0) return "Iv1.b507a08c87ecfe98";
     if (strcmp(provider, "qwen-oauth") == 0) return "f0304373b74a44d2b584a3fb70ca9e56";
     if (strcmp(provider, "openai-codex") == 0) return "app_EMoamEEZ73f0CkXaXp7hrann";
+    if (strcmp(provider, "cursor") == 0) return CURSOR_CLIENT_ID;
     return provider;
+}
+
+static int b64url_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '-' || c == '+') return 62;
+    if (c == '_' || c == '/') return 63;
+    return -1;
+}
+
+static int64_t cursor_expiry(const char *token) {
+    int64_t fallback = now_ms() + 3600 * 1000;
+    const char *a = token ? strchr(token, '.') : NULL;
+    const char *b = a ? strchr(a + 1, '.') : NULL;
+    if (!b || strchr(b + 1, '.')) return fallback;
+    size_t n = (size_t)(b - (a + 1));
+    char *raw = malloc(n + 1);
+    if (!raw) abort();
+    size_t len = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char *p = a + 1; p < b; p++) {
+        if (*p == '=') break;
+        int v = b64url_val(*p);
+        if (v < 0) {
+            free(raw);
+            return fallback;
+        }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            raw[len++] = (char)((acc >> bits) & 0xff);
+        }
+    }
+    raw[len] = '\0';
+    jval_t *j = j_parse(raw);
+    free(raw);
+    jval_t *exp = j && j->type == J_OBJ ? j_obj_get(j, "exp") : NULL;
+    int64_t out = fallback;
+    if (exp && exp->type == J_INT) out = exp->i * 1000 - 5 * 60 * 1000;
+    else if (exp && exp->type == J_NUM) out = (int64_t)(exp->d * 1000) - 5 * 60 * 1000;
+    j_free(j);
+    return out;
 }
 
 bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_tok_t *out, char *err, size_t err_n) {
@@ -598,15 +652,25 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
         file_unlock(rfd);
         return false;
     }
+    bool is_cursor = strcmp(prov_copy, "cursor") == 0;
     sb_t form;
     sb_init(&form);
-    sb_puts(&form, "grant_type=refresh_token&client_id=");
-    url_encode(client_id_for(prov_copy), &form);
-    sb_puts(&form, "&refresh_token=");
-    url_encode(cur.refresh, &form);
+    if (is_cursor) {
+        jval_t *pb = j_obj();
+        j_obj_set(pb, "grant_type", j_str("refresh_token"));
+        j_obj_set(pb, "client_id", j_str(CURSOR_CLIENT_ID));
+        j_obj_set(pb, "refresh_token", j_str(cur.refresh));
+        j_emit(pb, &form);
+        j_free(pb);
+    } else {
+        sb_puts(&form, "grant_type=refresh_token&client_id=");
+        url_encode(client_id_for(prov_copy), &form);
+        sb_puts(&form, "&refresh_token=");
+        url_encode(cur.refresh, &form);
+    }
 
     const char *hdrs[2] = {
-        "Content-Type: application/x-www-form-urlencoded",
+        is_cursor ? "Content-Type: application/json" : "Content-Type: application/x-www-form-urlencoded",
         "Accept: application/json"
     };
     http_resp_t resp;
@@ -619,7 +683,7 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
         file_unlock(rfd);
         return false;
     }
-    if (resp.status != 200) {
+    if (is_cursor ? (resp.status < 200 || resp.status > 299) : resp.status != 200) {
         snprintf(err, err_n, "%s refresh: HTTP %d: %s", name, resp.status, resp.body ? resp.body : "");
         http_resp_free(&resp);
         oa_tok_free(&cur);
@@ -630,6 +694,14 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
     http_resp_free(&resp);
     if (!j) {
         snprintf(err, err_n, "%s refresh: invalid JSON", name);
+        oa_tok_free(&cur);
+        file_unlock(rfd);
+        return false;
+    }
+    jval_t *logout = is_cursor ? j_obj_get(j, "shouldLogout") : NULL;
+    if (logout && logout->type == J_BOOL && logout->b) {
+        j_free(j);
+        snprintf(err, err_n, "%s refresh: invalid_grant: Cursor ended this session; run auth-router login %s again", name, name);
         oa_tok_free(&cur);
         file_unlock(rfd);
         return false;
@@ -647,7 +719,7 @@ bool oa_freshen_at(const char *name, const oa_tok_t *stored, int64_t at_ms, oa_t
     }
     out->access = xstrdup(acc);
     out->refresh = xstrdup(*ref ? ref : cur.refresh);
-    out->expires = now_ms() + secs * 1000;
+    out->expires = is_cursor ? cursor_expiry(acc) : now_ms() + secs * 1000;
     out->extra = j_clone(cur.extra);
     j_free(j);
     bool saved = oa_save_named(prov_copy, name, out, err, err_n);
@@ -694,8 +766,143 @@ static bool flows_write(const jval_t *obj, char *err, size_t err_n) {
     return ok;
 }
 
+static bool cursor_flow_start(const char *name, oa_dev_t *out, char *err, size_t err_n) {
+    uint8_t vb[96];
+    uint8_t ub[16];
+    if (!random_bytes(vb, sizeof(vb)) || !random_bytes(ub, sizeof(ub))) {
+        snprintf(err, err_n, "cursor: no randomness available");
+        return false;
+    }
+    char verifier[160];
+    base64url_encode(vb, sizeof(vb), verifier);
+    uint8_t dig[32];
+    sha256_bytes((const uint8_t *)verifier, strlen(verifier), dig);
+    char challenge[64];
+    base64url_encode(dig, 32, challenge);
+    ub[6] = (uint8_t)((ub[6] & 0x0f) | 0x40);
+    ub[8] = (uint8_t)((ub[8] & 0x3f) | 0x80);
+    char uuid[37];
+    snprintf(uuid, sizeof(uuid),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             ub[0], ub[1], ub[2], ub[3], ub[4], ub[5], ub[6], ub[7],
+             ub[8], ub[9], ub[10], ub[11], ub[12], ub[13], ub[14], ub[15]);
+
+    sb_t link;
+    sb_init(&link);
+    sb_puts(&link, env_or("CURSOR_LOGIN_URL", "https://cursor.com/loginDeepControl"));
+    sb_puts(&link, "?challenge=");
+    url_encode(challenge, &link);
+    sb_puts(&link, "&uuid=");
+    url_encode(uuid, &link);
+    sb_puts(&link, "&mode=login&redirectTarget=cli");
+    if (link.len >= sizeof(out->url)) {
+        sb_free(&link);
+        snprintf(err, err_n, "cursor: sign-in URL too long");
+        return false;
+    }
+    snprintf(out->url, sizeof(out->url), "%s", link.data);
+    sb_free(&link);
+    snprintf(out->code, sizeof(out->code), "%s", uuid);
+    out->interval = 1;
+    out->expires = 0;
+
+    jval_t *flows = NULL;
+    if (!flows_read(&flows, err, err_n)) return false;
+    jval_t *f = j_obj();
+    j_obj_set(f, "provider", j_str("cursor"));
+    j_obj_set(f, "code", j_str(uuid));
+    j_obj_set(f, "verifier", j_str(verifier));
+    j_obj_set(f, "url", j_str(out->url));
+    j_obj_set(f, "delay_ms", j_int(CURSOR_POLL_BASE_MS));
+    j_obj_set(f, "attempts", j_int(0));
+    j_obj_set(f, "errors", j_int(0));
+    j_obj_set(flows, name, f);
+    bool ok = flows_write(flows, err, err_n);
+    j_free(flows);
+    return ok;
+}
+
+static int cursor_flow_poll(jval_t *flows, jval_t *f, const char *name, int64_t *delay_out, char *err, size_t err_n) {
+    char uuid[64], verifier[160];
+    snprintf(uuid, sizeof(uuid), "%s", j_str_at(f, "code"));
+    snprintf(verifier, sizeof(verifier), "%s", j_str_at(f, "verifier"));
+    int64_t delay = CURSOR_POLL_BASE_MS, attempts = 0, errors = 0;
+    j_int_at(f, "delay_ms", &delay);
+    j_int_at(f, "attempts", &attempts);
+    j_int_at(f, "errors", &errors);
+    if (attempts >= CURSOR_POLL_MAX_ATTEMPTS) {
+        j_obj_del(flows, name);
+        flows_write(flows, err, err_n);
+        j_free(flows);
+        snprintf(err, err_n, "Cursor sign-in for %s timed out", name);
+        return -1;
+    }
+
+    sb_t url;
+    sb_init(&url);
+    sb_puts(&url, env_or("CURSOR_POLL_URL", "https://api2.cursor.sh/auth/poll"));
+    sb_puts(&url, "?uuid=");
+    url_encode(uuid, &url);
+    sb_puts(&url, "&verifier=");
+    url_encode(verifier, &url);
+    const char *hdrs[1] = {"Accept: application/json"};
+    http_resp_t resp;
+    char herr[256];
+    bool ok = http_request("GET", url.data, NULL, hdrs, 1, 30000, &resp, herr, sizeof(herr));
+    sb_free(&url);
+    attempts++;
+
+    if (ok && resp.status == 404) {
+        http_resp_free(&resp);
+        errors = 0;
+        delay = delay * 6 / 5;
+        if (delay > CURSOR_POLL_MAX_MS) delay = CURSOR_POLL_MAX_MS;
+    } else {
+        jval_t *j = NULL;
+        if (ok) {
+            if (resp.status >= 200 && resp.status <= 299) j = j_parse(resp.body ? resp.body : "");
+            if (!j || !*j_str_at(j, "accessToken")) {
+                snprintf(herr, sizeof(herr), "HTTP %d", resp.status);
+            }
+            http_resp_free(&resp);
+        }
+        if (j && *j_str_at(j, "accessToken")) {
+            oa_tok_t tok = {0};
+            tok.access = xstrdup(j_str_at(j, "accessToken"));
+            tok.refresh = xstrdup(j_str_at(j, "refreshToken"));
+            tok.expires = cursor_expiry(tok.access);
+            tok.extra = j_obj();
+            j_free(j);
+            bool saved = oa_save_named("cursor", name, &tok, err, err_n);
+            oa_tok_free(&tok);
+            j_obj_del(flows, name);
+            flows_write(flows, err, err_n);
+            j_free(flows);
+            return saved ? 1 : -1;
+        }
+        j_free(j);
+        errors++;
+        if (errors >= CURSOR_POLL_MAX_ERRORS) {
+            j_obj_del(flows, name);
+            flows_write(flows, err, err_n);
+            j_free(flows);
+            snprintf(err, err_n, "too many consecutive errors during Cursor sign-in polling (last: %s)", herr);
+            return -1;
+        }
+    }
+
+    j_obj_set(f, "delay_ms", j_int(delay));
+    j_obj_set(f, "attempts", j_int(attempts));
+    j_obj_set(f, "errors", j_int(errors));
+    bool wrote = flows_write(flows, err, err_n);
+    j_free(flows);
+    *delay_out = delay;
+    return wrote ? 0 : -1;
+}
+
 bool oa_flow_start_named(const char *provider, const char *name, oa_dev_t *out, char *err, size_t err_n) {
     memset(out, 0, sizeof(*out));
+    if (strcmp(provider, "cursor") == 0) return cursor_flow_start(name, out, err, err_n);
     const char *durl = device_url_for(provider);
     if (!*durl) {
         snprintf(err, err_n, "%s: no frontend sign-in flow yet; run crest-auth login %s", provider, provider);
@@ -758,7 +965,7 @@ bool oa_flow_start_named(const char *provider, const char *name, oa_dev_t *out, 
 }
 
 int oa_flow_poll(const char *name, int64_t *interval_out, char *err, size_t err_n) {
-    *interval_out = 5;
+    *interval_out = 5000;
     jval_t *flows = NULL;
     if (!flows_read(&flows, err, err_n)) return -1;
     jval_t *f = j_obj_get(flows, name);
@@ -769,6 +976,7 @@ int oa_flow_poll(const char *name, int64_t *interval_out, char *err, size_t err_
     }
     char prov[128], dcode[256];
     snprintf(prov, sizeof(prov), "%s", j_str_at(f, "provider"));
+    if (strcmp(prov, "cursor") == 0) return cursor_flow_poll(flows, f, name, interval_out, err, err_n);
     snprintf(dcode, sizeof(dcode), "%s", j_str_at(f, "code"));
     int64_t interval = 5, expires = 0;
     j_int_at(f, "interval", &interval);
@@ -811,7 +1019,7 @@ int oa_flow_poll(const char *name, int64_t *interval_out, char *err, size_t err_
     }
     const char *ec = j_str_at(j, "error");
     if (strcmp(ec, "authorization_pending") == 0) {
-        *interval_out = interval;
+        *interval_out = interval * 1000;
         j_free(j);
         j_free(flows);
         return 0;
@@ -820,7 +1028,7 @@ int oa_flow_poll(const char *name, int64_t *interval_out, char *err, size_t err_
         interval += 5;
         j_obj_set(f, "interval", j_int(interval));
         flows_write(flows, err, err_n);
-        *interval_out = interval;
+        *interval_out = interval * 1000;
         j_free(j);
         j_free(flows);
         return 0;
@@ -851,19 +1059,21 @@ int oa_flow_poll(const char *name, int64_t *interval_out, char *err, size_t err_
 }
 
 bool oa_login_named_interactive(const char *provider, const char *name, char *err, size_t err_n) {
-    if (strcmp(oa_flow_kind(provider), "device") != 0) {
+    const char *kind = oa_flow_kind(provider);
+    if (strcmp(kind, "device") != 0 && strcmp(kind, "poll") != 0) {
         snprintf(err, err_n, "%s: interactive browser login not implemented in this build", provider);
         return false;
     }
     oa_dev_t dev;
     if (!oa_flow_start_named(provider, name, &dev, err, err_n)) return false;
-    printf("Open %s and enter code: %s\n", dev.url, dev.user);
+    if (strcmp(kind, "poll") == 0) printf("Open %s to sign in, then wait here.\n", dev.url);
+    else printf("Open %s and enter code: %s\n", dev.url, dev.user);
     fflush(stdout);
+    int64_t delay = strcmp(kind, "poll") == 0 ? CURSOR_POLL_BASE_MS : 0;
     for (;;) {
-        int64_t interval = dev.interval;
-        int r = oa_flow_poll(name, &interval, err, err_n);
+        if (delay > 0) sleep_ms(delay);
+        int r = oa_flow_poll(name, &delay, err, err_n);
         if (r < 0) return false;
         if (r == 1) return true;
-        sleep_ms(interval * 1000);
     }
 }
