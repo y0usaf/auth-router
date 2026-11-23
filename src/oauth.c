@@ -589,8 +589,11 @@ static int64_t cursor_expiry(const char *token) {
     free(raw);
     jval_t *exp = j && j->type == J_OBJ ? j_obj_get(j, "exp") : NULL;
     int64_t out = fallback;
-    if (exp && exp->type == J_INT) out = exp->i * 1000 - 5 * 60 * 1000;
-    else if (exp && exp->type == J_NUM) out = (int64_t)(exp->d * 1000) - 5 * 60 * 1000;
+    if (exp && exp->type == J_INT && exp->i >= 0 && exp->i <= 253402300799LL) {
+        out = exp->i * 1000 - 5 * 60 * 1000;
+    } else if (exp && exp->type == J_NUM && exp->d >= 0 && exp->d <= 253402300799.0) {
+        out = (int64_t)(exp->d * 1000) - 5 * 60 * 1000;
+    }
     j_free(j);
     return out;
 }
